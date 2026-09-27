@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<title>MaiEngine v3 görselleri</title>
+<link rel="stylesheet" href="fonts.css">
+<style>
+  :root {
+    --bg: #0e1217;
+    --surface: #151b22;
+    --line: #232c36;
+    --ink: #eef2f5;
+    --ink2: #b7c1cc;
+    --muted: #7d8a99;
+    --mint: #3ecf9c;
+    --mint-dim: #1f6f55;
+    --loss: #d2d9e1;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #000; font-family: 'Grot', sans-serif; color: var(--ink); }
+  .card {
+    position: relative; overflow: hidden; background: var(--bg);
+    width: 1600px; height: 800px; padding: 64px 72px; margin-bottom: 40px;
+  }
+  .card::before { /* üst şerit */
+    content: ""; position: absolute; left: 0; top: 0; right: 0; height: 5px; background: var(--mint);
+  }
+  .eyebrow { font-family: 'Mono'; font-weight: 700; font-size: 17px; letter-spacing: .28em; color: var(--mint); text-transform: uppercase; }
+  .tag { position: absolute; right: 72px; top: 66px; font-family: 'Mono'; font-size: 16px; letter-spacing: .25em; color: var(--muted); }
+  h2 { font-family: 'Serif'; font-weight: 400; font-size: 76px; line-height: 1; margin-top: 14px; letter-spacing: -.01em; }
+  h2 em { font-style: normal; color: var(--mint); }
+  .sub { font-family: 'Mono'; font-size: 20px; color: var(--muted); margin-top: 14px; }
+  .foot { position: absolute; left: 72px; bottom: 34px; font-family: 'Mono'; font-size: 15px; color: var(--muted); }
+  .checker { position: absolute; right: 0; top: 0; bottom: 0; width: 520px; opacity: .55;
+    background-image: conic-gradient(#1a2129 25%, transparent 0 50%, #1a2129 0 75%, transparent 0);
+    background-size: 140px 140px;
+    -webkit-mask-image: linear-gradient(to left, #000 20%, transparent); mask-image: linear-gradient(to left, #000 20%, transparent); }
+
+  /* --- banner --- */
+  #banner { height: 400px; padding: 70px 80px; }
+  #banner h1 { font-family: 'Serif'; font-weight: 400; font-size: 132px; line-height: .95; letter-spacing: -.01em; position: relative; }
+  #banner h1 span { color: var(--mint); }
+  #banner h1 small { font-family: 'Grot'; font-weight: 700; font-size: 60px; color: var(--ink); margin-left: 18px; vertical-align: 14px;
+    border: 3px solid var(--mint); border-radius: 12px; padding: 0 16px; }
+  #banner .sub { font-size: 21px; color: var(--ink2); margin-top: 18px; position: relative; }
+  #banner .stats { display: flex; gap: 64px; margin-top: 46px; position: relative; }
+  .stat b { display: block; font-family: 'Grot'; font-weight: 700; font-size: 46px; line-height: 1; }
+  .stat b i { font-style: normal; color: var(--mint); }
+  .stat span { display: block; font-family: 'Mono'; font-size: 14px; letter-spacing: .18em; color: var(--muted); margin-top: 10px; text-transform: uppercase; }
+
+  /* --- sonuç kareleri --- */
+  .rows { margin-top: 48px; display: flex; flex-direction: column; gap: 30px; }
+  .row { display: grid; grid-template-columns: 430px 1fr 190px; align-items: center; column-gap: 28px; }
+  .row .name { font-family: 'Grot'; font-weight: 700; font-size: 38px; line-height: 1.05; }
+  .row .meta { font-family: 'Mono'; font-size: 16px; color: var(--muted); margin-top: 6px; }
+  .sq { display: flex; flex-wrap: wrap; gap: 5px; }
+  .sq i { display: block; width: 26px; height: 26px; border-radius: 4px; }
+  .sq.small i { width: 17px; height: 17px; border-radius: 3px; gap: 3px; }
+  .sq i.w { background: var(--mint); }
+  .sq i.d { border: 3px solid var(--mint); }
+  .sq i.l { background: var(--loss); position: relative; }
+  .sq i.l::after { content: "×"; position: absolute; inset: 0; display: grid; place-items: center; color: var(--bg); font-family: 'Grot'; font-weight: 700; font-size: 20px; line-height: 1; }
+  .sq.small i.l::after { font-size: 14px; }
+  .score { text-align: right; font-family: 'Grot'; font-weight: 700; font-size: 56px; line-height: 1; }
+  .score small { font-size: 24px; color: var(--muted); font-weight: 500; }
+  .score .elo { display: block; font-family: 'Mono'; font-weight: 400; font-size: 15px; color: var(--muted); margin-top: 6px; }
+  .legend { display: flex; gap: 34px; font-family: 'Mono'; font-size: 17px; color: var(--ink2); align-items: center; }
+  .legend .sq i { width: 20px; height: 20px; }
+  .legend > div { display: flex; gap: 10px; align-items: center; }
+
+  /* --- karşılaştırma çubukları --- */
+  .cmp { margin-top: 44px; display: flex; flex-direction: column; gap: 30px; }
+  .cmp .grp { display: grid; grid-template-columns: 360px 1fr; column-gap: 32px; align-items: center; }
+  .cmp .grp .name { font-family: 'Grot'; font-weight: 700; font-size: 34px; line-height: 1.05; }
+  .cmp .grp .meta { font-family: 'Mono'; font-size: 15px; color: var(--muted); margin-top: 6px; }
+  .bars { display: flex; flex-direction: column; gap: 8px; }
+  .bar { display: grid; grid-template-columns: 150px 1fr 120px; align-items: center; column-gap: 16px; font-family: 'Mono'; font-size: 17px; }
+  .bar .lab { color: var(--ink2); }
+  .bar .track { height: 30px; background: var(--surface); border-radius: 4px; position: relative; }
+  .bar .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px; }
+  .bar .fill.us { background: var(--mint); }
+  .bar .fill.them { background: #4a5663; }
+  .bar .val { text-align: right; font-family: 'Grot'; font-weight: 700; font-size: 26px; }
+  .bar .val.us { color: var(--ink); }
+  .bar .val.them { color: var(--ink2); }
+  .half { position: absolute; top: -8px; bottom: -8px; width: 0; border-left: 2px dashed #3a4552; }
+
+  /* --- yolculuk --- */
+  .journey { position: absolute; left: 72px; right: 72px; top: 240px; bottom: 90px; }
+
+  /* --- özellik kartları --- */
+  .grid { margin-top: 40px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; }
+  .f { border: 2px solid var(--line); border-radius: 10px; padding: 26px 28px; min-height: 250px; position: relative; background: var(--surface); }
+  .f.hi { background: var(--mint); border-color: var(--mint); color: #06140f; }
+  .f .k { font-family: 'Mono'; font-weight: 700; font-size: 14px; letter-spacing: .25em; color: var(--mint); }
+  .f.hi .k { color: #06140f; opacity: .75; }
+  .f .n { position: absolute; right: 24px; top: 24px; font-family: 'Mono'; font-size: 14px; color: var(--muted); }
+  .f.hi .n { color: #06140f; opacity: .6; }
+  .f h3 { font-family: 'Grot'; font-weight: 700; font-size: 50px; letter-spacing: -.02em; margin-top: 8px; line-height: 1.05; }
+  .f p { font-family: 'Mono'; font-size: 17px; margin-top: 8px; }
+  .f .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
+  .f .chips span { font-family: 'Mono'; font-size: 13px; border: 1.5px solid var(--line); padding: 4px 8px; border-radius: 4px; color: var(--ink2); }
+  .f.hi .chips span { border-color: rgba(6,20,15,.35); color: #06140f; }
+</style>
+</head>
+<body>
+
+<!-- ============ BANNER ============ -->
+<section class="card" id="banner">
+  <div class="checker"></div>
+  <h1>Mai<span>Engine</span><small>v3</small></h1>
+  <div class="sub">C++ ile sıfırdan yazılmış UCI satranç motoru · Stockfish 15.1 NNUE · her değişiklik maçla ölçüldü</div>
+  <div class="stats">
+    <div class="stat"><b><i>+269</i></b><span lang="en">elo · inphish 5.0'a karşı</span></div>
+    <div class="stat"><b>0</b><span>süreden kayıp</span></div>
+    <div class="stat"><b>2,0M</b><span lang="en">düğüm/sn · MacBook Air</span></div>
+    <div class="stat"><b>300/300</b><span>NNUE birebir</span></div>
+  </div>
+</section>
+
+<!-- ============ SONUÇLAR: inphish ============ -->
+<section class="card" id="results-inphish" style="height:760px">
+  <div class="eyebrow">Maçlar</div>
+  <div class="tag">MAIENGINE V3</div>
+  <h2>inphish'e karşı<em>.</em></h2>
+  <div class="sub">dengeli açılışlar · her açılış iki renkle · aynı makine · 2 çekirdek</div>
+  <div class="rows" id="rows-inphish"></div>
+  <div class="foot"><span class="legend" style="display:inline-flex">
+    <div><span class="sq"><i class="w"></i></span>kazanç</div>
+    <div><span class="sq"><i class="d"></i></span>beraberlik</div>
+    <div><span class="sq"><i class="l"></i></span>yenilgi</div>
+  </span></div>
+</section>
+
+<!-- ============ SONUÇLAR: Stockfish 19 ============ -->
+<section class="card" id="results-sf" style="height:760px">
+  <div class="eyebrow" lang="en">Stockfish 19'a karşı</div>
+  <div class="tag">1+0.01 · 20 OYUN</div>
+  <h2>Aynı rakip, aynı makine<em>.</em></h2>
+  <div class="sub">MaiEngine v3 ve inphish 5.0 aynı Stockfish 19 ayarlarına karşı · puan / 20</div>
+  <div class="cmp" id="cmp-sf"></div>
+  <div class="foot">UCI_Elo, Stockfish'in kendini zayıflattığı ayar; 3190 en üst değeri. "Tam güç" = sınırsız Stockfish 19.</div>
+</section>
+
+<!-- ============ YOLCULUK ============ -->
+<section class="card" id="journey">
+  <div class="eyebrow">Yolculuk</div>
+  <div class="tag">V1 → V2 → V3</div>
+  <h2>Üç sürümde inphish<em>.</em></h2>
+  <div class="sub">inphish'e karşı alınan puan (%) · her sürümün kendi ölçümü</div>
+  <svg class="journey" id="journey-svg" viewBox="0 0 1456 470"></svg>
+  <div class="foot">v1: inphish 4.0'ın ölçümü (1+0.01, 20 oyun, 11'i süreden) · v2: 1 dk + 0,6 sn, 34 oyun · v3: 10+0.1, 60 oyun</div>
+</section>
+
+<!-- ============ HIZ ============ -->
+<section class="card" id="speed" style="height:600px">
+  <div class="eyebrow">Hız</div>
+  <div class="tag">TEK ÇEKİRDEK</div>
+  <h2>Saniyede düğüm<em>.</em></h2>
+  <div class="sub">başlangıç pozisyonu ve orta oyun, 10'ar saniye düşünme · aynı bulut makinesi</div>
+  <div class="cmp" id="cmp-speed"></div>
+  <div class="foot" id="speed-foot"></div>
+</section>
+
+<!-- ============ ÖZELLİKLER ============ -->
+<section class="card" id="features" style="height: 870px">
+  <div class="eyebrow">Özellikler</div>
+  <div class="tag">MAIENGINE V3</div>
+  <h2>Motorun içi<em>.</em></h2>
+  <div class="sub">her parçanın kendi testi var · sayılar testlerin çıktısı</div>
+  <div class="grid">
+    <div class="f"><div class="k">ARAMA</div><div class="n">01</div><h3>PVS</h3><p>Stockfish 15.1 yapısı</p>
+      <div class="chips"><span>aspiration</span><span>null move</span><span>ProbCut</span><span>tekil uzatma</span><span>LMR</span><span>LMP</span><span>futility</span><span>razoring</span><span>IIR</span><span>SEE budama</span><span>history ×3</span></div></div>
+    <div class="f hi"><div class="k">DEĞERLENDİRME</div><div class="n">02</div><h3>NNUE</h3><p>300 / 300 birebir, Stockfish 15.1</p>
+      <div class="chips"><span>HalfKAv2_hm</span><span>1024×2</span><span>8 yığın</span><span>ARM sdot</span><span>AVX2</span><span>Finny tablosu</span><span>tembel güncelleme</span></div></div>
+    <div class="f"><div class="k">TAHTA</div><div class="n">03</div><h3>Bitboard</h3><p>1020 / 1020 perft, python-chess</p>
+      <div class="chips"><span>magic</span><span>legal üretim</span><span>pin maskesi</span><span>~280 milyon/sn perft</span></div></div>
+    <div class="f"><div class="k">TAKTİK</div><div class="n">04</div><h3>SEE</h3><p>şah kuralıyla · 584 alış kontrol</p>
+      <div class="chips"><span>şah korunan kareye giremez</span><span>v2'nin mat hatası yok</span></div></div>
+    <div class="f"><div class="k">ZAMAN</div><div class="n">05</div><h3>0 kayıp</h3><p>süreden, 170 oyunda</p>
+      <div class="chips"><span>1+0.01 güvenli</span><span>mutlak sınır</span><span>düşen skor</span><span>kararsızlık</span></div></div>
+    <div class="f"><div class="k">PARALEL</div><div class="n">06</div><h3>Lazy SMP</h3><p>UCI · 1-512 iş parçacığı</p>
+      <div class="chips"><span>Hash</span><span>Threads</span><span>Move Overhead</span><span>EvalFile</span></div></div>
+  </div>
+</section>
+
+<script>
+const DATA = window.DATA || {};
+
+function squares(w, d, l, small) {
+  const s = document.createElement('div');
+  s.className = 'sq' + (small ? ' small' : '');
+  for (let i = 0; i < w; i++) s.insertAdjacentHTML('beforeend', '<i class="w"></i>');
+  for (let i = 0; i < d; i++) s.insertAdjacentHTML('beforeend', '<i class="d"></i>');
+  for (let i = 0; i < l; i++) s.insertAdjacentHTML('beforeend', '<i class="l"></i>');
+  return s;
+}
+function fmt(x) { return String(x).replace('.', ','); }
+
+function buildRows(el, rows) {
+  for (const r of rows) {
+    const n = r.w + r.d + r.l, pts = r.w + r.d / 2;
+    const row = document.createElement('div'); row.className = 'row';
+    row.innerHTML = `<div><div class="name">${r.name}</div><div class="meta">${r.meta}</div></div>`;
+    row.appendChild(squares(r.w, r.d, r.l, n > 20));
+    row.insertAdjacentHTML('beforeend', `<div class="score">${fmt(pts)}<small>/${n}</small><span class="elo">${r.elo || ''}</span></div>`);
+    el.appendChild(row);
+  }
+}
+
+function buildCmp(el, groups, max, unit) {
+  for (const g of groups) {
+    const grp = document.createElement('div'); grp.className = 'grp';
+    let bars = '';
+    for (const b of g.bars) {
+      const pct = Math.max(0.4, 100 * b.v / max);
+      bars += `<div class="bar"><div class="lab">${b.lab}</div><div class="track">${g.half ? `<div class="half" style="left:50%"></div>` : ''}<div class="fill ${b.us ? 'us' : 'them'}" style="width:${pct}%"></div></div><div class="val ${b.us ? 'us' : 'them'}">${b.txt ?? fmt(b.v)}${unit || ''}</div></div>`;
+    }
+    grp.innerHTML = `<div><div class="name">${g.name}</div><div class="meta">${g.meta || ''}</div></div><div class="bars">${bars}</div>`;
+    el.appendChild(grp);
+  }
+}
+
+function buildJourney(svg, pts) {
+  const W = 1456, H = 470, x0 = 140, x1 = W - 110, yTop = 30, yBot = H - 80;
+  const y = p => yBot - (yBot - yTop) * p / 100;
+  const xs = pts.map((_, i) => x0 + (x1 - x0) * i / (pts.length - 1));
+  let s = '';
+  for (const g of [0, 25, 50, 75, 100]) {
+    s += `<line x1="${x0 - 40}" x2="${x1 + 60}" y1="${y(g)}" y2="${y(g)}" stroke="${g === 50 ? '#3a4552' : '#1c242d'}" stroke-width="2" ${g === 50 ? 'stroke-dasharray="6 6"' : ''}/>`;
+    s += `<text x="${x0 - 56}" y="${y(g) + 6}" fill="#7d8a99" font-family="Mono" font-size="17" text-anchor="end">%${g}</text>`;
+  }
+  s += `<text x="${x0 - 30}" y="${y(50) - 10}" fill="#7d8a99" font-family="Mono" font-size="15" text-anchor="start">başa baş</text>`;
+  const path = pts.map((p, i) => `${i ? 'L' : 'M'}${xs[i]},${y(p.v)}`).join(' ');
+  s += `<path d="${path} L${xs.at(-1)},${yBot} L${xs[0]},${yBot} Z" fill="#3ecf9c" opacity=".10"/>`;
+  s += `<path d="${path}" fill="none" stroke="#3ecf9c" stroke-width="4" stroke-linejoin="round"/>`;
+  // Etiket yerleri: v1 sağ-üst, v2 sol-üst, v3 sol-üst (çizginin üstünde kalır)
+  const place = [
+    { dx: 26, dy: -58, a: 'start' },
+    { dx: -26, dy: -60, a: 'end' },
+    { dx: -30, dy: -22, a: 'end' },
+  ];
+  pts.forEach((p, i) => {
+    s += `<circle cx="${xs[i]}" cy="${y(p.v)}" r="13" fill="#3ecf9c" stroke="#0e1217" stroke-width="4"/>`;
+    const pl = place[i] || place[0];
+    const lx = xs[i] + pl.dx, ly = y(p.v) + pl.dy;
+    s += `<text x="${lx}" y="${ly}" fill="#eef2f5" font-family="Grot" font-weight="700" font-size="54" text-anchor="${pl.a}">%${fmt(p.v)}</text>`;
+    s += `<text x="${lx}" y="${ly + 28}" fill="#7d8a99" font-family="Mono" font-size="17" text-anchor="${pl.a}">${p.elo}</text>`;
+    s += `<text x="${xs[i]}" y="${H - 34}" fill="#eef2f5" font-family="Mono" font-weight="700" font-size="22" text-anchor="middle">${p.name}</text>`;
+    if (p.add) {
+      const mx = (xs[i - 1] + xs[i]) / 2;
+      s += `<text x="${mx}" y="${H - 34}" fill="#3ecf9c" font-family="Mono" font-weight="700" font-size="17" text-anchor="middle">${p.add}</text>`;
+    }
+  });
+  svg.innerHTML = s;
+}
+
+window.build = function (D) {
+  buildRows(document.getElementById('rows-inphish'), D.inphish);
+  buildCmp(document.getElementById('cmp-sf'), D.sf, 20);
+  buildJourney(document.getElementById('journey-svg'), D.journey);
+  buildCmp(document.getElementById('cmp-speed'), D.speed, D.speedMax);
+  document.getElementById('speed-foot').textContent = D.speedFoot;
+  window.READY = true;
+};
+</script>
+</body>
+</html>

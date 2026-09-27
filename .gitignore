@@ -7,3 +7,8 @@ build/
 .vscode/
 .DS_Store
 __pycache__/
+tools/video/node_modules/
+tools/video/frames/
+tools/video/music.wav
+tools/video/timing.json
+tools/video/package-lock.json

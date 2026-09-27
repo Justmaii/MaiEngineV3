@@ -1,11 +1,21 @@
+<p align="center">
+  <img src="docs/images/banner.png" alt="MaiEngine v3" width="100%">
+</p>
+
 # MaiEngine v3
 
-C++20 ile sıfırdan yazılan satranç motoru. MaiEngine v2'nin (C#) devamı; hedef:
-**inphish**'i yenmek.
+C++20 ile sıfırdan yazılan UCI satranç motoru. MaiEngine v2'nin (C#) devamı; hedef:
+**inphish**'i yenmek — ve şu an **inphish 5.0'a karşı +269 elo** (10+0.1, 60 oyun, hiç yenilgi yok).
+
+🎬 **Tanıtım videosu:** [`docs/MaiEngine_v3_tanitim.mp4`](docs/MaiEngine_v3_tanitim.mp4) (64 sn, müzikli)
 
 Lisans: **GPLv3** (bkz. `LICENSE`). Değerlendirme için Stockfish 15.1 NNUE ağı
 kullanılıyor; arama Stockfish 15.1'deki formüller/parametreler örnek alınarak
 yazıldı (kod kopyalanmadan). Kaynak: <https://github.com/official-stockfish/Stockfish>.
+
+<p align="center"><img src="docs/images/results-inphish.png" alt="inphish'e karşı sonuçlar" width="100%"></p>
+<p align="center"><img src="docs/images/results-sf.png" alt="Stockfish 19'a karşı" width="100%"></p>
+<p align="center"><img src="docs/images/journey.png" alt="v1'den v3'e inphish'e karşı" width="100%"></p>
 
 ## Durum
 
@@ -51,6 +61,8 @@ maiengine                        (argümansız) UCI modu
 ```
 
 UCI seçenekleri: `Hash` (64), `Threads` (1), `Move Overhead` (10 ms), `Clear Hash`, `EvalFile`.
+
+<p align="center"><img src="docs/images/features.png" alt="Özellikler" width="100%"></p>
 
 ## Tasarım (adım 1)
 
@@ -107,6 +119,21 @@ iki renkle). inphish GitHub kaynağından derlendi (bench imzaları README'leriy
 | inphish 5.0.0 (SF19 ağı) | 1+0.01 | 40 | +29 =10 −1 | +301 ±118 | 0 / 0 |
 | inphish 5.0.0 (SF19 ağı) | 10+0.1 | 60 | +39 =21 −0 | +269 ±75 | 0 / 0 |
 
+### Stockfish 19'a karşı (inphish'in "UCI_Elo merdiveni" yöntemiyle, aynı makinede)
+
+Stockfish 19 kaynaktan derlendi (`sf_19`, ağ `nn-1a298aa575a0`). 1+0.01, 20 oyun,
+renkler değişerek. Karşılaştırma için inphish 5.0 da **aynı makinede aynı maçları** oynadı.
+
+| Rakip | MaiEngine v3 | inphish 5.0 |
+|---|---|---|
+| SF19 `UCI_Elo 3000` | **19,5/20** (+19 =1 −0) | 13,5/20 (+9 =9 −2) |
+| SF19 `UCI_Elo 3190` (en üst ayar) | **17/20** (+14 =6 −0) | 10/20 (+5 =10 −5) |
+| SF19 **tam güç** (sınırsız) | **6,5/20** (+0 =13 −7), −127 ±85 | 2/20 (+0 =4 −16), −382 |
+
+Not: `UCI_Elo` ölçeği üstte doyuyor (v2'de de görmüştük: 3000 ve 3190 aynı sonucu
+veriyordu); bu yüzden tam güç Stockfish'e karşı sonuç daha anlamlı. inphish kendi
+makinesinde SF19 3000'e karşı 16/20, 3190'a karşı 12,5/20 bildirmişti.
+
 ## Doğrulama
 
 | Test | Sonuç |
@@ -126,15 +153,30 @@ iki renkle). inphish GitHub kaynağından derlendi (bench imzaları README'leriy
 | Bulut VM (Xeon 2.1 GHz) | ~210 Mnps |
 | MacBook Air, Linux VM (aarch64, g++ 11) | ~278 Mnps |
 
-## Hız (arama, `bench 13`, tek çekirdek; imza 1419059 düğüm, her yerde aynı)
+## Hız (arama)
 
-| Makine | MaiEngine v3 | inphish 4 | inphish 5 |
-|---|---|---|---|
-| **MacBook Air, macOS (Apple clang)** | **~2,0M nps** | ~1,24M nps (v2 notları) | |
-| MacBook Air, Linux VM (aarch64, g++ 11) | ~1,15M nps | | |
-| Bulut VM (Xeon 2.1 GHz) | ~805k nps | ~800k nps | ~375k nps |
+<p align="center"><img src="docs/images/speed.png" alt="Arama hızı" width="100%"></p>
 
-(v2: 200-370k nps.)
+`tools/speed.py`: tek iş parçacığı, Hash 64, başlangıç + bir orta oyun pozisyonu, 10'ar sn,
+aynı bulut makinesi: MaiEngine v3 768k · inphish 4.0 711k · Stockfish 19 557k · inphish 5.0 383k
+düğüm/sn. (SF19 ve inphish 5 daha büyük bir ağ kullanıyor, düğüm başına daha pahalı.)
+
+`bench 13` (22 pozisyon, sabit derinlik; imza **1419059** düğüm, her mimaride aynı):
+
+| Makine | MaiEngine v3 |
+|---|---|
+| **MacBook Air, macOS (Apple clang)** | **~2,0M nps** |
+| MacBook Air, Linux VM (aarch64, g++ 11) | ~1,15M nps |
+| Bulut VM (Xeon 2.1 GHz) | ~805k nps |
+
+(v2, C#: 200-370k nps.)
+
+## Görseller ve video
+
+`tools/video/`: `graphics.html` + `data.json` → `node graphics.js` README görsellerini,
+`video.html` → `node render.js` (Playwright ile kare kare) + `music.py` (telifsiz,
+numpy ile sentez) + ffmpeg tanıtım videosunu üretir. Her sayı `maclar/` altındaki
+maç kayıtlarından geliyor. Kurulum: `cd tools/video && npm install`.
 
 ## Negatif sonuçlar
 

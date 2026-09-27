@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<title>MaiEngine v3 tanıtım</title>
+<link rel="stylesheet" href="fonts.css">
+<style>
+  :root { --bg:#0e1217; --surface:#151b22; --line:#232c36; --ink:#eef2f5; --ink2:#b7c1cc; --muted:#7d8a99; --mint:#3ecf9c; --loss:#d2d9e1; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 1920px; height: 1080px; overflow: hidden; background: var(--bg); color: var(--ink); font-family: 'Grot', sans-serif; }
+  .scene { position: absolute; inset: 0; padding: 110px 130px; opacity: 0; }
+  .checker { position: absolute; inset: 0; opacity: .5;
+    background-image: conic-gradient(#171e26 25%, transparent 0 50%, #171e26 0 75%, transparent 0); background-size: 160px 160px; }
+  .bar-top { position: absolute; left: 0; top: 0; height: 6px; background: var(--mint); }
+  .eyebrow { font-family: 'Mono'; font-weight: 700; font-size: 22px; letter-spacing: .3em; color: var(--mint); }
+  h1 { font-family: 'Serif'; font-weight: 400; font-size: 190px; line-height: .95; }
+  h1 span { color: var(--mint); }
+  h2 { font-family: 'Serif'; font-weight: 400; font-size: 104px; line-height: 1; margin-top: 18px; }
+  h2 em { font-style: normal; color: var(--mint); }
+  .sub { font-family: 'Mono'; font-size: 28px; color: var(--muted); margin-top: 22px; }
+  .big { font-family: 'Grot'; font-weight: 700; }
+  .mint { color: var(--mint); }
+  .ver { display: inline-block; font-family: 'Grot'; font-weight: 700; font-size: 86px; border: 5px solid var(--mint); border-radius: 18px; padding: 0 22px; vertical-align: 26px; margin-left: 20px; }
+  .chip { display: inline-block; font-family: 'Mono'; font-size: 24px; border: 2px solid var(--line); padding: 8px 14px; border-radius: 6px; color: var(--ink2); margin: 0 10px 12px 0; background: var(--surface); }
+  .sq { display: flex; flex-wrap: wrap; gap: 8px; width: 1060px; }
+  .sq i { display: block; width: 44px; height: 44px; border-radius: 6px; }
+  .sq i.w { background: var(--mint); }
+  .sq i.d { border: 4px solid var(--mint); }
+  .sq i.l { background: var(--loss); }
+  .barrow { display: grid; grid-template-columns: 300px 1fr 170px; align-items: center; column-gap: 24px; margin-top: 26px; font-family: 'Mono'; font-size: 28px; }
+  .track { height: 50px; background: var(--surface); border-radius: 6px; position: relative; }
+  .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 6px; background: #4a5663; }
+  .fill.us { background: var(--mint); }
+  .val { text-align: right; font-family: 'Grot'; font-weight: 700; font-size: 44px; }
+</style>
+</head>
+<body>
+
+<!-- 1. Giriş -->
+<div class="scene" id="s1">
+  <div class="checker" id="s1check"></div>
+  <div class="bar-top" id="s1bar"></div>
+  <div style="position:absolute; left:130px; top:330px">
+    <div class="eyebrow" id="s1eb">SATRANÇ MOTORU · C++</div>
+    <h1 id="s1t" style="margin-top:26px">Mai<span>Engine</span><span class="ver" id="s1v">v3</span></h1>
+    <div class="sub" id="s1s" style="font-size:32px; color:var(--ink2)">sıfırdan yazıldı · her değişiklik maçla ölçüldü</div>
+  </div>
+</div>
+
+<!-- 2. Hedef -->
+<div class="scene" id="s2">
+  <div class="eyebrow">HEDEF</div>
+  <h2>Arkadaşımın motoru: <em>inphish</em></h2>
+  <div class="sub">Rust · 4 günde 740'tan 3149'a · kendi ölçeklerinde</div>
+  <div id="s2a" style="margin-top:90px; font-family:'Mono'; font-size:36px; color:var(--ink2)">5.0 yolda: <b class="mint" style="font-family:'Grot'; font-size:56px">Stockfish 19'un ağı</b></div>
+  <div id="s2b" style="margin-top:30px; font-family:'Mono'; font-size:36px; color:var(--ink2)">MaiEngine v2 ona karşı: <b style="font-family:'Grot'; font-size:56px; color:var(--ink)">%10</b></div>
+</div>
+
+<!-- 3. Yolculuk -->
+<div class="scene" id="s3">
+  <div class="eyebrow">YOLCULUK</div>
+  <h2>inphish'e karşı puan<em>.</em></h2>
+  <svg id="s3svg" viewBox="0 0 1660 640" style="position:absolute; left:130px; top:330px; width:1660px; height:640px"></svg>
+</div>
+
+<!-- 4. Motorun içi -->
+<div class="scene" id="s4">
+  <div class="eyebrow">MOTORUN İÇİ</div>
+  <h2>Her parçanın testi var<em>.</em></h2>
+  <div id="s4rows" style="margin-top:56px"></div>
+</div>
+
+<!-- 5. Hız -->
+<div class="scene" id="s5">
+  <div class="eyebrow">HIZ · TEK ÇEKİRDEK</div>
+  <h2>Saniyede düğüm<em>.</em></h2>
+  <div class="sub">aynı makine · aynı pozisyonlar</div>
+  <div id="s5bars" style="margin-top:60px"></div>
+  <div id="s5mac" style="margin-top:56px; font-family:'Mono'; font-size:30px; color:var(--ink2)">MacBook Air'de: <b class="mint" style="font-family:'Grot'; font-size:52px">2,0 milyon</b> düğüm/sn</div>
+</div>
+
+<!-- 6. inphish maçı -->
+<div class="scene" id="s6">
+  <div class="eyebrow" lang="en">INPHISH 5.0'A KARŞI · 10+0.1 · 60 OYUN</div>
+  <h2>Sonuç<em>.</em></h2>
+  <div style="display:flex; gap:80px; margin-top:70px; align-items:flex-start">
+    <div class="sq" id="s6sq"></div>
+    <div>
+      <div class="big" id="s6score" style="font-size:150px; line-height:1">0</div>
+      <div style="font-family:'Mono'; font-size:30px; color:var(--muted)">/ 60 puan</div>
+      <div class="big mint" id="s6elo" style="font-size:72px; margin-top:34px">+269 elo</div>
+      <div id="s6tf" style="font-family:'Mono'; font-size:28px; color:var(--ink2); margin-top:20px">0 yenilgi · 0 süreden kayıp</div>
+    </div>
+  </div>
+</div>
+
+<!-- 7. Stockfish 19 -->
+<div class="scene" id="s7">
+  <div class="eyebrow" lang="en">STOCKFISH 19'A KARŞI · 1+0.01 · 20 OYUN</div>
+  <h2>Aynı rakip, aynı makine<em>.</em></h2>
+  <div id="s7bars" style="margin-top:40px"></div>
+</div>
+
+<!-- 8. Kapanış -->
+<div class="scene" id="s8">
+  <div class="checker"></div>
+  <div style="position:absolute; left:130px; top:300px">
+    <h1 style="font-size:150px">Mai<span>Engine</span><span class="ver">v3</span></h1>
+    <div class="big" id="s8gh" style="font-size:56px; margin-top:50px">github.com/Justmaii/MaiEngineV3</div>
+    <div class="sub" style="font-size:30px">C++20 · macOS · Linux · GPLv3 · Stockfish 15.1 NNUE</div>
+  </div>
+</div>
+
+<script>
+// ---------- zaman çizelgesi (saniye) ----------
+const S = [
+  { id: 's1', a: 0, b: 6 },
+  { id: 's2', a: 6, b: 12 },
+  { id: 's3', a: 12, b: 22 },
+  { id: 's4', a: 22, b: 30 },
+  { id: 's5', a: 30, b: 38 },
+  { id: 's6', a: 38, b: 50 },
+  { id: 's7', a: 50, b: 58 },
+  { id: 's8', a: 58, b: 64 },
+];
+window.TOTAL = 64;
+window.WIPES = S.slice(1).map(s => s.a);           // müzikte geçiş efekti
+window.HITS = [15.2, 18.2, 45.0, 58.2];         // müzikte vurgu
+
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const ease = x => { x = clamp(x); return x < .5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2; };
+const out = x => 1 - Math.pow(1 - clamp(x), 3);
+const lerp = (a, b, t) => a + (b - a) * t;
+const $ = id => document.getElementById(id);
+const fmt = x => String(x).replace('.', ',');
+
+// giriş/çıkış: 0.5 sn yukarı kayarak belir, 0.4 sn solarak çık
+function sceneAlpha(sc, t) {
+  const inT = out((t - sc.a) / 0.5), outT = 1 - clamp((t - (sc.b - 0.4)) / 0.4);
+  return Math.min(inT, sc.b === TOTAL ? 1 : outT);
+}
+function reveal(el, t, t0, dur = .5, dy = 30) {
+  const k = out((t - t0) / dur);
+  el.style.opacity = k;
+  el.style.transform = `translateY(${(1 - k) * dy}px)`;
+}
+
+// ---------- yolculuk svg ----------
+const J = [
+  { name: 'v1 · C#', v: 0, lab: '0/20 · 11 süreden', t: 1.0 },
+  { name: 'v2 · C# + NNUE', v: 10.3, lab: '3,5/34 · −376 elo', add: '+ Stockfish 15.1 ağı', t: 3.2 },
+  { name: 'v3 · C++', v: 82.5, lab: '49,5/60 · +269 elo', add: '+ C++, bitboard, yeni arama', t: 6.2 },
+];
+function drawJourney(lt) {
+  const W = 1660, H = 640, x0 = 170, x1 = W - 120, yT = 60, yB = H - 110;
+  const y = p => yB - (yB - yT) * p / 100, xs = J.map((_, i) => x0 + (x1 - x0) * i / (J.length - 1));
+  let s = '';
+  for (const g of [0, 50, 100]) {
+    s += `<line x1="${x0 - 60}" x2="${x1 + 80}" y1="${y(g)}" y2="${y(g)}" stroke="${g === 50 ? '#3a4552' : '#1c242d'}" stroke-width="2" ${g === 50 ? 'stroke-dasharray="8 8"' : ''}/>`;
+    s += `<text x="${x0 - 76}" y="${y(g) + 8}" fill="#7d8a99" font-family="Mono" font-size="24" text-anchor="end">%${g}</text>`;
+  }
+  s += `<text x="${x0 - 50}" y="${y(50) - 14}" fill="#7d8a99" font-family="Mono" font-size="22">başa baş</text>`;
+  // çizgi, noktalar arası animasyonlu
+  let d = `M${xs[0]},${y(J[0].v)}`;
+  for (let i = 1; i < J.length; i++) {
+    const k = ease((lt - J[i].t + 1.2) / 1.2);
+    if (k <= 0) break;
+    const X = lerp(xs[i - 1], xs[i], k), Y = lerp(y(J[i - 1].v), y(J[i].v), k);
+    d += ` L${X},${Y}`;
+  }
+  if (lt > J[0].t) s += `<path d="${d}" fill="none" stroke="#3ecf9c" stroke-width="6" stroke-linejoin="round" stroke-linecap="round"/>`;
+  const place = [{ dx: 30, dy: -70, a: 'start' }, { dx: -30, dy: -74, a: 'end' }, { dx: -36, dy: -30, a: 'end' }];
+  J.forEach((p, i) => {
+    const k = out((lt - p.t) / .45);
+    s += `<text x="${xs[i]}" y="${H - 40}" fill="#eef2f5" font-family="Mono" font-weight="700" font-size="30" text-anchor="middle" opacity="${out((lt - .3) / .5)}">${p.name}</text>`;
+    if (p.add) s += `<text x="${(xs[i - 1] + xs[i]) / 2}" y="${H - 40}" fill="#3ecf9c" font-family="Mono" font-weight="700" font-size="24" text-anchor="middle" opacity="${out((lt - p.t + 1.2) / .5)}">${p.add}</text>`;
+    if (k <= 0) return;
+    const pl = place[i], lx = xs[i] + pl.dx, ly = y(p.v) + pl.dy;
+    const shown = (p.v * clamp((lt - p.t) / .8)).toFixed(1).replace(/\.0$/, '');
+    s += `<circle cx="${xs[i]}" cy="${y(p.v)}" r="${18 * k}" fill="#3ecf9c" stroke="#0e1217" stroke-width="6"/>`;
+    s += `<text x="${lx}" y="${ly}" fill="#eef2f5" font-family="Grot" font-weight="700" font-size="${i === 2 ? 96 : 76}" text-anchor="${pl.a}" opacity="${k}">%${fmt(shown)}</text>`;
+    s += `<text x="${lx}" y="${ly + 40}" fill="#7d8a99" font-family="Mono" font-size="26" text-anchor="${pl.a}" opacity="${k}">${p.lab}</text>`;
+  });
+  $('s3svg').innerHTML = s;
+}
+
+// ---------- motorun içi ----------
+const F = [
+  ['NNUE', '300 / 300 birebir', ['Stockfish 15.1 ağı', 'ARM sdot', 'AVX2', 'Finny tablosu'], true],
+  ['Hamle üretimi', '1020 / 1020 perft', ['bitboard', 'magic', 'pin maskesi', 'python-chess ile']],
+  ['Arama', 'Stockfish 15.1 yapısı', ['PVS', 'null move', 'ProbCut', 'tekil uzatma', 'LMR', 'SEE budama']],
+  ['SEE', 'şah kuralıyla', ['v2\'nin mat hatası yok', '584 alış kontrol']],
+  ['Zaman', '0 süreden kayıp', ['170 oyun', '1+0.01 güvenli', 'mutlak sınır']],
+  ['Lazy SMP', 'çok çekirdek', ['Threads', 'Hash', 'UCI']],
+];
+$('s4rows').innerHTML = `<div style="display:grid; grid-template-columns:repeat(3,1fr); gap:26px">` + F.map((f, i) => `<div id="f${i}" style="border:2px solid ${f[3] ? 'var(--mint)' : 'var(--line)'}; background:${f[3] ? 'var(--mint)' : 'var(--surface)'}; color:${f[3] ? '#06140f' : 'var(--ink)'}; border-radius:12px; padding:30px 32px; height:290px">
+  <div class="big" style="font-size:60px; letter-spacing:-.02em">${f[0]}</div>
+  <div style="font-family:'Mono'; font-size:28px; margin:10px 0 18px">${f[1]}</div>${f[2].map(c => `<span class="chip" style="font-size:20px; ${f[3] ? 'background:transparent; border-color:rgba(6,20,15,.35); color:#06140f' : ''}">${c}</span>`).join('')}</div>`).join('') + `</div>`;
+
+// ---------- hız ----------
+const SP = [['MaiEngine v3', 768445, true], ['inphish 4.0', 711290], ['Stockfish 19', 556806], ['inphish 5.0', 383230]];
+$('s5bars').innerHTML = SP.map((b, i) => `<div class="barrow"><div style="color:var(--ink2)">${b[0]}</div><div class="track"><div class="fill ${b[2] ? 'us' : ''}" id="sp${i}"></div></div><div class="val" id="spv${i}">0</div></div>`).join('');
+
+// ---------- inphish kareleri ----------
+const RES = [].concat(Array(39).fill('w'), Array(21).fill('d'));
+$('s6sq').innerHTML = RES.map((c, i) => `<i id="q${i}" class="${c}"></i>`).join('');
+
+// ---------- Stockfish ----------
+const SF = [
+  ['UCI_Elo 3000', 19.5, 13.5], ['UCI_Elo 3190', 17, 10], ['Tam güç', 6.5, 2],
+];
+$('s7bars').innerHTML = SF.map((g, i) => `<div style="margin-top:36px"><div class="big" style="font-size:44px">${g[0]}</div>
+  <div class="barrow" style="margin-top:12px"><div style="color:var(--ink)">MaiEngine v3</div><div class="track"><div class="fill us" id="sfa${i}"></div></div><div class="val" id="sfav${i}">0</div></div>
+  <div class="barrow" style="margin-top:10px"><div style="color:var(--ink2)">inphish 5.0</div><div class="track"><div class="fill" id="sfb${i}"></div></div><div class="val" style="color:var(--ink2)" id="sfbv${i}">0</div></div></div>`).join('');
+
+// ---------- ana çizim ----------
+window.render = function (t) {
+  for (const sc of S) {
+    const el = $(sc.id), a = sceneAlpha(sc, t);
+    el.style.opacity = t >= sc.a && t <= sc.b ? a : 0;
+    el.style.transform = `translateY(${(1 - out((t - sc.a) / .5)) * 24}px)`;
+  }
+  // 1
+  const t1 = t - 0;
+  $('s1bar').style.width = (100 * ease(t1 / 1.2)) + '%';
+  $('s1check').style.opacity = .5 * out(t1 / 1.5);
+  $('s1check').style.backgroundPosition = `${-t1 * 12}px ${t1 * 6}px`;
+  reveal($('s1eb'), t1, .3); reveal($('s1t'), t1, .6, .7, 50); reveal($('s1s'), t1, 1.6);
+  $('s1v').style.transform = `scale(${lerp(1.6, 1, out((t1 - 1.2) / .5))})`; $('s1v').style.opacity = out((t1 - 1.2) / .4);
+  // 2
+  reveal($('s2a'), t - 6, 1.6); reveal($('s2b'), t - 6, 3.0);
+  // 3
+  drawJourney(t - 12);
+  // 4
+  F.forEach((_, i) => reveal($('f' + i), t - 22, .5 + i * .6, .5, 40));
+  // 5
+  SP.forEach((b, i) => {
+    const k = ease((t - 30 - .6 - i * .35) / 1.4);
+    $('sp' + i).style.width = (100 * b[1] / 800000 * k) + '%';
+    $('spv' + i).textContent = Math.round(b[1] * k / 1000) + 'k';
+  });
+  reveal($('s5mac'), t - 30, 4.2);
+  // 6
+  const n = Math.floor(clamp((t - 38 - .6) / 6) * RES.length + 1e-9);
+  let pts = 0;
+  RES.forEach((c, i) => {
+    const on = i < n; $('q' + i).style.opacity = on ? 1 : .08;
+    if (on) pts += c === 'w' ? 1 : .5;
+  });
+  $('s6score').textContent = fmt(pts);
+  reveal($('s6elo'), t - 38, 7.0); reveal($('s6tf'), t - 38, 7.8);
+  // 7
+  SF.forEach((g, i) => {
+    const k = ease((t - 50 - .6 - i * .8) / 1.2);
+    $('sfa' + i).style.width = (100 * g[1] / 20 * k) + '%';
+    $('sfb' + i).style.width = (100 * g[2] / 20 * k) + '%';
+    $('sfav' + i).textContent = fmt(Math.round(g[1] * k * 2) / 2);
+    $('sfbv' + i).textContent = fmt(Math.round(g[2] * k * 2) / 2);
+  });
+  // 8
+  reveal($('s8gh'), t - 58, .8);
+};
+document.fonts.ready.then(() => { render(0); window.READY = true; });
+</script>
+</body>
+</html>

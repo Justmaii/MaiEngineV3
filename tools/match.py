@@ -28,8 +28,14 @@ def parse_tc(tc):
 
 
 def open_engine(cmd, options):
-    eng = chess.engine.SimpleEngine.popen_uci(shlex.split(cmd), cwd=os.path.dirname(os.path.abspath(shlex.split(cmd)[0])) or None)
-    opts = {k: v for k, v in options.items() if k in eng.options}
+    parts = shlex.split(cmd)
+    parts[0] = os.path.abspath(parts[0])  # motor kendi klasöründe çalışır (ağ dosyası orada)
+    eng = chess.engine.SimpleEngine.popen_uci(parts, cwd=os.path.dirname(parts[0]))
+    def conv(v):
+        if v.lower() in ("true", "false"):
+            return v.lower() == "true"
+        return int(v) if v.lstrip("-").isdigit() else v
+    opts = {k: conv(v) for k, v in options.items() if k in eng.options}
     if opts:
         eng.configure(opts)
     return eng

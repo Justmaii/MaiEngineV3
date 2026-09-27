@@ -1,0 +1,32 @@
+{
+  "inphish": [
+    {"name": "inphish 5.0", "meta": "10+0.1 · 60 oyun · SF19 ağı", "w": 39, "d": 21, "l": 0, "elo": "+269 ±75 elo"},
+    {"name": "inphish 5.0", "meta": "1+0.01 · 40 oyun", "w": 29, "d": 10, "l": 1, "elo": "+301 ±118 elo"},
+    {"name": "inphish 4.0", "meta": "1+0.01 · 10 oyun · SF15.1 ağı", "w": 7, "d": 3, "l": 0, "elo": "az oyun"}
+  ],
+  "sf": [
+    {"name": "UCI_Elo 3000", "meta": "Stockfish 19", "bars": [
+      {"lab": "MaiEngine v3", "v": 19.5, "us": true},
+      {"lab": "inphish 5.0", "v": 13.5, "us": false}]},
+    {"name": "UCI_Elo 3190", "meta": "Stockfish 19 · en üst ayar", "half": true, "bars": [
+      {"lab": "MaiEngine v3", "v": 17, "us": true},
+      {"lab": "inphish 5.0", "v": 10, "us": false}]},
+    {"name": "Tam güç", "meta": "sınırsız Stockfish 19", "half": true, "bars": [
+      {"lab": "MaiEngine v3", "v": 6.5, "us": true},
+      {"lab": "inphish 5.0", "v": 2, "us": false}]}
+  ],
+  "journey": [
+    {"name": "v1 · C#", "v": 0, "elo": "0/20 · 11 süreden"},
+    {"name": "v2 · C# + NNUE", "v": 10.3, "elo": "3,5/34 · −376 elo", "add": "+ Stockfish 15.1 ağı"},
+    {"name": "v3 · C++", "v": 82.5, "elo": "49,5/60 · +269 elo", "add": "+ C++, bitboard, yeni arama"}
+  ],
+  "speed": [
+    {"name": "Arama hızı", "meta": "düğüm / saniye", "bars": [
+      {"lab": "MaiEngine v3", "v": 768445, "txt": "768k", "us": true},
+      {"lab": "inphish 4.0", "v": 711290, "txt": "711k", "us": false},
+      {"lab": "Stockfish 19", "v": 556806, "txt": "557k", "us": false},
+      {"lab": "inphish 5.0", "v": 383230, "txt": "383k", "us": false}]}
+  ],
+  "speedMax": 800000,
+  "speedFoot": "MacBook Air'de (macOS, tek çekirdek) MaiEngine v3: ~2,0M düğüm/sn · v2 (C#): 200-370k · SF19 ve inphish 5 daha büyük ağ kullanır, düğüm başına daha pahalı"
+}

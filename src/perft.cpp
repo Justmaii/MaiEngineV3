@@ -77,6 +77,22 @@ uint64_t verify(Position& pos, int depth, uint64_t& nodes) {
     if (copy.fen() != pos.fen() || copy.key() != pos.key() || copy.pawn_key() != pos.pawn_key())
         report("FEN gidiş-dönüş anahtarı tutmuyor");
 
+    // legal_move: listedeki her hamle legal, rastgele 16 bit değerlerin legal sayılanları listede olmalı
+    for (const auto& em : all)
+        if (!pos.legal_move(em.move)) report("legal_move listedeki hamleyi reddetti: " + move_to_uci(em.move));
+    for (int r = 0; r < 64; ++r) {
+        Move junk(uint16_t((nodes * 2654435761u + r * 40503u) & 0xFFFF));
+        if (pos.legal_move(junk) && !all.contains(junk)) report("legal_move çöp hamleyi kabul etti: " + move_to_uci(junk));
+    }
+
+    for (const auto& em : all) {
+        bool predicted = pos.gives_check(em.move);
+        pos.do_move(em.move);
+        bool actual = pos.checkers() != 0;
+        pos.undo_move(em.move);
+        if (predicted != actual) report("gives_check yanlış: " + move_to_uci(em.move));
+    }
+
     if (depth <= 0) return errors;
     for (const auto& em : all) {
         std::string before = pos.fen();

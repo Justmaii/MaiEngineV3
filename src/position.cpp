@@ -152,6 +152,7 @@ bool Position::set(const std::string& fen) {
     states.back().key = compute_key();
     states.back().pawnKey = compute_pawn_key();
     states.back().checkers = attackers_to(king_square(sideToMove)) & pieces(~sideToMove);
+    set_check_info(states.back());
     // Hamle sırası olmayan taraf şahta olamaz
     if (attackers_to(king_square(~sideToMove)) & pieces(sideToMove)) return false;
     return true;
@@ -225,6 +226,11 @@ void Position::do_move(Move m) {
     ++st.rule50;
     ++st.pliesFromNull;
     st.captured = captured;
+    DirtyPiece& dp = st.dirty;
+    dp.count = 1;
+    dp.piece[0] = pc;
+    dp.from[0] = from;
+    dp.to[0] = to;
 
     if (m.type_of() == CASTLING) {
         const bool kingSide = to > from;
@@ -234,9 +240,17 @@ void Position::do_move(Move m) {
         move_piece(from, to);
         move_piece(rfrom, rto);
         k ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to] ^ Zobrist::psq[rook][rfrom] ^ Zobrist::psq[rook][rto];
+        dp.count = 2;
+        dp.piece[1] = rook;
+        dp.from[1] = rfrom;
+        dp.to[1] = rto;
     } else {
         if (captured) {
             Square capsq = m.type_of() == EN_PASSANT ? to - pawn_push(us) : to;
+            dp.count = 2;
+            dp.piece[1] = captured;
+            dp.from[1] = capsq;
+            dp.to[1] = SQ_NONE;
             remove_piece(capsq);
             k ^= Zobrist::psq[captured][capsq];
             if (type_of(captured) == PAWN) st.pawnKey ^= Zobrist::psq[captured][capsq];
@@ -253,6 +267,11 @@ void Position::do_move(Move m) {
                 remove_piece(to);
                 put_piece(promo, to);
                 k ^= Zobrist::psq[pc][to] ^ Zobrist::psq[promo][to];
+                dp.to[0] = SQ_NONE;  // piyon kalktı, terfi taşı geldi
+                dp.piece[dp.count] = promo;
+                dp.from[dp.count] = SQ_NONE;
+                dp.to[dp.count] = to;
+                ++dp.count;
             } else {
                 st.pawnKey ^= Zobrist::psq[pc][to];
                 // Çift adım: rakip piyon alabiliyorsa en passant karesini kaydet
@@ -278,6 +297,7 @@ void Position::do_move(Move m) {
     sideToMove = them;
     ++gamePly;
     st.checkers = attackers_to(king_square(them)) & pieces(us);
+    set_check_info(st);
     states.push_back(st);
 }
 
@@ -319,8 +339,10 @@ void Position::do_null_move() {
     st.pliesFromNull = 0;
     st.captured = NO_PIECE;
     st.checkers = 0;
+    st.dirty.count = 0;
     sideToMove = ~sideToMove;
     ++gamePly;
+    set_check_info(st);
     states.push_back(st);
 }
 
@@ -349,6 +371,127 @@ bool Position::is_draw(int ply) const {
         }
     }
     return false;
+}
+
+void Position::update_slider_blockers(StateInfo& st, Color c) const {
+    const Square ksq = king_square(c);
+    st.blockersForKing[c] = 0;
+    st.pinners[~c] = 0;
+    Bitboard snipers = ((attacks_bb<ROOK>(ksq) & pieces(QUEEN, ROOK)) | (attacks_bb<BISHOP>(ksq) & pieces(QUEEN, BISHOP)))
+                     & pieces(~c);
+    const Bitboard occ = pieces() ^ snipers;
+    while (snipers) {
+        Square sn = pop_lsb(snipers);
+        Bitboard b = between_bb(ksq, sn) & occ;
+        if (b && !more_than_one(b)) {
+            st.blockersForKing[c] |= b;
+            if (b & pieces(c)) st.pinners[~c] |= square_bb(sn);
+        }
+    }
+}
+
+void Position::set_check_info(StateInfo& st) const {
+    update_slider_blockers(st, WHITE);
+    update_slider_blockers(st, BLACK);
+    const Square ksq = king_square(~sideToMove);
+    st.checkSquares[PAWN] = pawn_attacks(~sideToMove, ksq);
+    st.checkSquares[KNIGHT] = attacks_bb<KNIGHT>(ksq);
+    st.checkSquares[BISHOP] = attacks_bb<BISHOP>(ksq, pieces());
+    st.checkSquares[ROOK] = attacks_bb<ROOK>(ksq, pieces());
+    st.checkSquares[QUEEN] = st.checkSquares[BISHOP] | st.checkSquares[ROOK];
+    st.checkSquares[KING] = 0;
+}
+
+bool Position::gives_check(Move m) const {
+    const Square from = m.from_sq(), to = m.to_sq();
+    const Color us = sideToMove;
+    const Square ksq = king_square(~us);
+
+    // Doğrudan şah
+    if (m.type_of() != CASTLING && (check_squares(type_of(board[from])) & square_bb(to))) return true;
+    // Açarak şah
+    if ((blockers_for_king(~us) & square_bb(from)) && (!aligned(from, to, ksq) || m.type_of() == CASTLING))
+        return true;
+
+    switch (m.type_of()) {
+    case NORMAL: return false;
+    case PROMOTION: return attacks_bb(m.promotion_type(), to, pieces() ^ square_bb(from)) & square_bb(ksq);
+    case EN_PASSANT: {
+        Square capsq = make_square(file_of(to), rank_of(from));
+        Bitboard b = (pieces() ^ square_bb(from) ^ square_bb(capsq)) | square_bb(to);
+        return (attacks_bb<ROOK>(ksq, b) & pieces(us, QUEEN, ROOK)) | (attacks_bb<BISHOP>(ksq, b) & pieces(us, QUEEN, BISHOP));
+    }
+    default: {  // rok: kalenin yeni karesinden şah var mı
+        Square rto = relative_square(us, to > from ? SQ_F1 : SQ_D1);
+        Bitboard occ = (pieces() ^ square_bb(from)) | square_bb(to);
+        return attacks_bb<ROOK>(rto, occ) & square_bb(ksq);
+    }
+    }
+}
+
+bool Position::see_ge(Move m, int threshold) const {
+    if (m.type_of() != NORMAL) return 0 >= threshold;
+
+    const Square from = m.from_sq(), to = m.to_sq();
+    int swap = PieceValueMg[board[to]] - threshold;
+    if (swap < 0) return false;
+    swap = PieceValueMg[board[from]] - swap;
+    if (swap <= 0) return true;
+
+    Bitboard occ = pieces() ^ square_bb(from) ^ square_bb(to);
+    Color stm = sideToMove;
+    Bitboard attackers = attackers_to(to, occ);
+    Bitboard stmAttackers, bb;
+    int res = 1;
+
+    while (true) {
+        stm = ~stm;
+        attackers &= occ;
+        if (!(stmAttackers = attackers & pieces(stm))) break;
+        // Açmazdaki taşlar (açmaz yapan taş hâlâ tahtadaysa) alamaz
+        if (pinners(~stm) & occ) {
+            stmAttackers &= ~blockers_for_king(stm);
+            if (!stmAttackers) break;
+        }
+        res ^= 1;
+        // En değersiz taşla al
+        if ((bb = stmAttackers & pieces(PAWN))) {
+            if ((swap = PawnValueMg - swap) < res) break;
+            occ ^= bb & -bb;
+            attackers |= attacks_bb<BISHOP>(to, occ) & pieces(BISHOP, QUEEN);
+        } else if ((bb = stmAttackers & pieces(KNIGHT))) {
+            if ((swap = KnightValueMg - swap) < res) break;
+            occ ^= bb & -bb;
+        } else if ((bb = stmAttackers & pieces(BISHOP))) {
+            if ((swap = BishopValueMg - swap) < res) break;
+            occ ^= bb & -bb;
+            attackers |= attacks_bb<BISHOP>(to, occ) & pieces(BISHOP, QUEEN);
+        } else if ((bb = stmAttackers & pieces(ROOK))) {
+            if ((swap = RookValueMg - swap) < res) break;
+            occ ^= bb & -bb;
+            attackers |= attacks_bb<ROOK>(to, occ) & pieces(ROOK, QUEEN);
+        } else if ((bb = stmAttackers & pieces(QUEEN))) {
+            if ((swap = QueenValueMg - swap) < res) break;
+            occ ^= bb & -bb;
+            attackers |= (attacks_bb<BISHOP>(to, occ) & pieces(BISHOP, QUEEN))
+                       | (attacks_bb<ROOK>(to, occ) & pieces(ROOK, QUEEN));
+        } else {
+            // ŞAH KURALI: şahla "alıyoruz" ama rakibin hâlâ saldıranı varsa
+            // şah o kareye giremez -> sonuç tersine döner.
+            // (v2'deki kritik hata buydu: vezirle şah çekişler yanlış budanıyordu.)
+            return (attackers & ~pieces(stm)) ? res ^ 1 : res;
+        }
+    }
+    return bool(res);
+}
+
+bool Position::legal_move(Move m) const {
+    if (!m.is_ok()) return false;
+    const Piece pc = board[m.from_sq()];
+    if (pc == NO_PIECE || color_of(pc) != sideToMove) return false;
+    // Hamle üreticisi hangi listeye koyuyorsa orada ara (garip TT hamleleri hiçbirinde yoktur)
+    if (capture_stage(m)) return MoveList<CAPTURES>(*this).contains(m);
+    return MoveList<QUIETS>(*this).contains(m);
 }
 
 Key Position::compute_key() const {

@@ -1,0 +1,9 @@
+/maiengine
+/maiengine-debug
+*.o
+*.dSYM/
+build/
+*.nnue
+.vscode/
+.DS_Store
+__pycache__/

@@ -124,9 +124,17 @@ iki renkle). inphish GitHub kaynağından derlendi (bench imzaları README'leriy
 | Makine | `bench` |
 |---|---|
 | Bulut VM (Xeon 2.1 GHz) | ~210 Mnps |
+| MacBook Air, Linux VM (aarch64, g++ 11) | ~278 Mnps |
 
-(v2'de C# ile bu ölçülmemişti; asıl kıyas arama hızında olacak: v2 200-370k nps,
-inphish ~1,24M nps.)
+## Hız (arama, `bench 13`, tek çekirdek; imza 1419059 düğüm, her yerde aynı)
+
+| Makine | MaiEngine v3 | inphish 4 | inphish 5 |
+|---|---|---|---|
+| **MacBook Air, macOS (Apple clang)** | **~2,0M nps** | ~1,24M nps (v2 notları) | |
+| MacBook Air, Linux VM (aarch64, g++ 11) | ~1,15M nps | | |
+| Bulut VM (Xeon 2.1 GHz) | ~805k nps | ~800k nps | ~375k nps |
+
+(v2: 200-370k nps.)
 
 ## Negatif sonuçlar
 

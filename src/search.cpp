@@ -84,8 +84,8 @@ std::string pv_string(const std::vector<Move>& pv) {
 
 }  // namespace
 
-std::string uci_score(Value v) {
-    if (std::abs(v) < VALUE_MATE_IN_MAX_PLY) return "cp " + std::to_string(Eval::to_cp(v));
+std::string uci_score(Value v, const Position& pos) {
+    if (std::abs(v) < VALUE_MATE_IN_MAX_PLY) return "cp " + std::to_string(Eval::to_cp(v, pos));
     return "mate " + std::to_string((v > 0 ? VALUE_MATE - v + 1 : -VALUE_MATE - v) / 2);
 }
 
@@ -293,7 +293,7 @@ void Thread::search_root() {
     if (rootMoves.empty()) {
         rootMoves.emplace_back(Move::none());
         if (!Threads.silent)
-            std::cout << "info depth 0 score " << uci_score(rootPos.checkers() ? -VALUE_MATE : VALUE_DRAW) << std::endl;
+            std::cout << "info depth 0 score " << uci_score(rootPos.checkers() ? -VALUE_MATE : VALUE_DRAW, rootPos) << std::endl;
     } else {
         Threads.start_helpers();
         id_loop();
@@ -316,7 +316,7 @@ void Thread::search_root() {
             TimePoint el = std::max<TimePoint>(Time.elapsed(), 1);
             uint64_t n = Threads.nodes_searched();
             std::cout << "info depth " << best->completedDepth << " seldepth " << rm.selDepth << " score "
-                      << uci_score(rm.uciScore) << " nodes " << n << " nps " << n * 1000 / el << " time " << el
+                      << uci_score(rm.uciScore, rootPos) << " nodes " << n << " nps " << n * 1000 / el << " time " << el
                       << " pv" << pv_string(rm.pv) << std::endl;
         }
         std::cout << "bestmove " << move_to_uci(rm.pv[0]);
@@ -409,7 +409,7 @@ void Thread::id_loop() {
             const TimePoint el = std::max<TimePoint>(Time.elapsed(), 1);
             const uint64_t n = Threads.nodes_searched();
             std::cout << "info depth " << completedDepth << " seldepth " << rm.selDepth << " score "
-                      << uci_score(rm.uciScore)
+                      << uci_score(rm.uciScore, rootPos)
                       << (rm.scoreLowerbound ? " lowerbound" : rm.scoreUpperbound ? " upperbound" : "")
                       << " nodes " << n << " nps " << n * 1000 / el << " hashfull " << TT.hashfull() << " time "
                       << el << " pv" << pv_string(rm.pv) << std::endl;

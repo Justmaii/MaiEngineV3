@@ -1,9 +1,14 @@
-// MaiEngine v3 — NNUE değerlendirmesi (Stockfish 15.1 ağı, HalfKAv2_hm)
+// MaiEngine v3 — NNUE değerlendirmesi (Stockfish 19 ağı)
 // Copyright (C) 2026 Mai (Justmaii). GPLv3, bkz. LICENSE.
 //
-// Ağ: nn-ad9b42354671.nnue (Stockfish 15.1, GPLv3). Mimari Stockfish'ten,
+// Ağ: nn-1a298aa575a0.nnue (Stockfish 19, GPLv3). Mimari Stockfish'ten,
 // çıkarım kodu bizim. Sonuç Stockfish'in çıktısıyla birebir aynı olmak zorunda
 // (bkz. `maiengine nnuecheck`).
+//
+// Girdiler üç özellik setinin toplamı, hepsi aynı 1024'lük accumulator'a eklenir:
+//  - HalfKAv2_hm (şah kovası x taş x kare, int16 ağırlık) — SF15.1'dekiyle aynı
+//  - FullThreats (hangi taş hangi taşa saldırıyor, int8 ağırlık)
+//  - PP_3Wide (aynı/komşu dikeydeki piyon çiftleri, int8 ağırlık)
 #pragma once
 
 #include <cstdint>
@@ -15,30 +20,54 @@
 namespace mai::NNUE {
 
 constexpr int HalfDims = 1024;
-constexpr int InputDims = 22528;  // 32 şah kovası * 11 taş tipi * 64 kare
+constexpr int PsqDims = 22528;     // 32 şah kovası * 11 taş tipi * 64 kare
+constexpr int ThreatDims = 59808;  // FullThreats
+constexpr int PairDims = 4560;     // PP_3Wide: 96 piyon kimliği, ikili kombinasyon
+constexpr int OtherDims = ThreatDims + PairDims;  // int8 ağırlıklı blok (tehdit + piyon çifti)
 constexpr int PsqtBuckets = 8;
 constexpr int LayerStacks = 8;
-constexpr int L1Out = 16;  // 15 + 1 doğrudan çıkışa giden
-constexpr int L2In = 32;   // 30 gerçek + 2 dolgu
-constexpr int L2Out = 32;
-constexpr int L3In = 32;
+constexpr int L2 = 32;  // fc0 çıkışı (son ikisi farkı doğrudan çıkışa gider)
+constexpr int L3 = 32;  // fc1 çıkışı
 
-constexpr const char* DefaultNetName = "nn-ad9b42354671.nnue";
+constexpr int MaxThreats = 256;  // bir pozisyondaki etkin tehdit sayısı sınırı
+
+constexpr const char* DefaultNetName = "nn-1a298aa575a0.nnue";
 
 // Ağı yükler; hata varsa açıklamasını err'e yazar.
 bool load(const std::string& path, std::string* err = nullptr);
 bool loaded();
 const std::string& description();
 
-// Bir bakış açısının ilk katman toplamları
+// Ağın iki parçası, Stockfish'in iç ölçeğinde, sırası gelen tarafın gözünden
+struct Output {
+    int psqt, positional;
+    int sum() const { return psqt + positional; }
+};
+
+// Bir pozisyonun iki bakıştan ilk katman toplamları, iki parça halinde. Ağa giden
+// toplam = psq + thr. Ayrı tutmanın nedeni: şah oynayınca HalfKA kısmı Finny
+// tablosundan tazelenir ama şah tahtanın ortasını geçmedikçe tehditler aynı
+// yönde kalır ve artımlı güncellenmeye devam eder.
 struct alignas(64) Accumulator {
-    int16_t acc[COLOR_NB][HalfDims];
-    int32_t psqt[COLOR_NB][PsqtBuckets];
-    Key key[COLOR_NB];  // bu kayıt hangi pozisyon için hesaplandı (0 = geçersiz)
+    int16_t psq[COLOR_NB][HalfDims];  // HalfKAv2_hm + bias
+    int16_t thr[COLOR_NB][HalfDims];  // tehdit + piyon çifti
+    int32_t psqtPsq[COLOR_NB][PsqtBuckets];
+    int32_t psqtThr[COLOR_NB][PsqtBuckets];
+    Key key[COLOR_NB];      // bu kayıt hangi pozisyon için hesaplandı (0 = geçersiz)
+    Square ksq[COLOR_NB];   // hesaplandığında bakışın şah karesi
+};
+
+// Bir pozisyonun bakıştan bağımsız tehdit listesi (sıralı) ve piyonları.
+// Atayla şimdiki pozisyon arasındaki fark, eklenecek/çıkarılacak özellikleri verir.
+struct ThreatState {
+    Key key = 0;
+    int count = 0;
+    Bitboard pawns[COLOR_NB] = {};
+    uint32_t list[MaxThreats];
 };
 
 // Finny tablosu: her (bakış, şah karesi) için en son görülen taş dizilimi ve
-// toplamı. Şah oynayınca sıfırdan toplamak yerine sadece farkları uygularız.
+// HalfKA toplamı. Şah oynayınca sıfırdan toplamak yerine sadece farkları uygularız.
 struct alignas(64) FinnyEntry {
     int16_t acc[HalfDims];
     int32_t psqt[PsqtBuckets];
@@ -50,22 +79,23 @@ struct alignas(64) FinnyEntry {
 class Evaluator {
 public:
     Evaluator();
-    // Sırası gelen tarafın gözünden, Stockfish'in iç ölçeğinde (piyon ~ 208)
-    int evaluate(const Position& pos);
+    Output evaluate(const Position& pos);
     void clear();  // Finny tablosunu ve yığını sıfırla (yeni oyun)
 
     // İstatistik (hız profili için)
-    uint64_t refreshes = 0, updates = 0;
+    uint64_t refreshes = 0, updates = 0, rows = 0;  // rows: uygulanan int8 satır sayısı
 
 private:
+    void ensure_threats(const Position& pos, int idx);
     void update(const Position& pos, int idx, Color persp);
-    void refresh(const Position& pos, Accumulator& acc, Color persp);
+    void refresh_psq(const Position& pos, int idx, Color persp);
 
-    std::vector<Accumulator> stack;  // pos.state_index() ile indekslenir
-    std::vector<FinnyEntry> finny;   // [renk][şah karesi]
+    std::vector<Accumulator> stack;   // pos.state_index() ile indekslenir
+    std::vector<ThreatState> threats;  // aynı indeksle
+    std::vector<FinnyEntry> finny;     // [renk][şah karesi]
 };
 
 // Test/karşılaştırma için: accumulator kullanmadan sıfırdan değerlendirme
-int evaluate_scratch(const Position& pos);
+Output evaluate_scratch(const Position& pos);
 
 }  // namespace mai::NNUE

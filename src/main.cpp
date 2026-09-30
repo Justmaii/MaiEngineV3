@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "bitboard.h"
+#include "evaluate.h"
 #include "misc.h"
 #include "movegen.h"
 #include "nnue.h"
@@ -57,9 +58,11 @@ bool load_net(const std::string& given = "") {
 uint64_t nnue_incremental_check(Position& pos, NNUE::Evaluator& ev, int depth, PRNG& rng, uint64_t& nodes) {
     ++nodes;
     uint64_t errors = 0;
-    int a = ev.evaluate(pos), b = NNUE::evaluate_scratch(pos);
-    if (a != b) {
-        if (errors++ < 5) std::cout << "HATA: artımlı " << a << " != sıfırdan " << b << "  " << pos.fen() << "\n";
+    const NNUE::Output a = ev.evaluate(pos), b = NNUE::evaluate_scratch(pos);
+    if (a.psqt != b.psqt || a.positional != b.positional) {
+        if (errors++ < 5)
+            std::cout << "HATA: artımlı " << a.psqt << "/" << a.positional << " != sıfırdan " << b.psqt << "/"
+                      << b.positional << "  " << pos.fen() << "\n";
     }
     if (depth == 0) return errors;
     MoveList<LEGAL> moves(pos);
@@ -158,7 +161,8 @@ int main(int argc, char** argv) {
         return errors ? 1 : 0;
     }
     if (cmd == "nnuecheck") {
-        // nnuecheck <referans dosyası> [ağ]: "FEN;değer" satırları, değer Stockfish'in ham NNUE çıktısı
+        // nnuecheck <referans dosyası> [ağ]: "FEN;psqt;katmanlar;son" satırları (Stockfish'in ham NNUE
+        // çıktısının iki parçası ve iyimserliksiz son değerlendirmesi, sıradaki tarafın gözünden)
         if (!load_net(args.size() > 2 ? args[2] : "")) return 1;
         std::cout << "Ağ: " << NNUE::description() << "\n";
         int total = 0, ok = 0;
@@ -167,16 +171,25 @@ int main(int argc, char** argv) {
             std::string line;
             NNUE::Evaluator ev;
             while (std::getline(in, line)) {
-                size_t semi = line.rfind(';');
-                if (semi == std::string::npos) continue;
-                if (!pos.set(line.substr(0, semi))) continue;
-                int expected = std::stoi(line.substr(semi + 1));
-                int got = NNUE::evaluate_scratch(pos), got2 = ev.evaluate(pos);
+                if (line.empty() || line[0] == '#') continue;
+                std::vector<std::string> f;
+                for (size_t a = 0, b; a <= line.size(); a = b + 1) {
+                    b = line.find(';', a);
+                    if (b == std::string::npos) b = line.size();
+                    f.push_back(line.substr(a, b - a));
+                }
+                if (f.size() != 4 || !pos.set(f[0])) continue;
+                const int psqt = std::stoi(f[1]), positional = std::stoi(f[2]), final = std::stoi(f[3]);
+                const NNUE::Output got = NNUE::evaluate_scratch(pos), got2 = ev.evaluate(pos);
+                const int gotFinal = Eval::evaluate(pos, ev);
                 ++total;
-                if (got == expected && got2 == expected) ++ok;
+                if (got.psqt == psqt && got.positional == positional && got2.psqt == psqt
+                    && got2.positional == positional && gotFinal == final)
+                    ++ok;
                 else if (total - ok <= 5)
-                    std::cout << "FARK: beklenen " << expected << ", sıfırdan " << got << ", artımlı " << got2 << "  "
-                              << line.substr(0, semi) << "\n";
+                    std::cout << "FARK: beklenen " << psqt << "/" << positional << "/" << final << ", sıfırdan "
+                              << got.psqt << "/" << got.positional << ", artımlı " << got2.psqt << "/"
+                              << got2.positional << "/" << gotFinal << "  " << f[0] << "\n";
             }
             std::cout << "Stockfish referansı: " << ok << "/" << total << " birebir\n";
         }
@@ -234,7 +247,7 @@ int main(int argc, char** argv) {
         uint64_t evals = 0;
         int64_t sink = 0;
         std::function<void(int)> walk = [&](int d) {
-            sink += ev.evaluate(pos);
+            sink += ev.evaluate(pos).sum();
             ++evals;
             if (!d) return;
             for (const auto& em : MoveList<LEGAL>(pos)) {
@@ -250,7 +263,7 @@ int main(int argc, char** argv) {
         walk(4);
         TimePoint ms = std::max<TimePoint>(now() - start, 1);
         std::cout << evals << " değerlendirme, " << ms << " ms, " << evals * 1000 / ms << " eval/s (tazeleme "
-                  << ev.refreshes << ", güncelleme " << ev.updates << ", sink " << sink % 7 << ")\n";
+                  << ev.refreshes << ", güncelleme " << ev.updates << ", int8 satır " << ev.rows << ", sink " << sink % 7 << ")\n";
         return 0;
     }
     if (cmd == "bench") {

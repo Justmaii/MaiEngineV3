@@ -156,9 +156,10 @@ void loop(const std::string& exeDir) {
         } else if (token == "eval") {
             if (netOk) {
                 NNUE::Evaluator ev;
-                int raw = ev.evaluate(pos);
-                std::cout << "NNUE (ham, sıra gelen taraf): " << raw << "  (" << Eval::to_cp(raw) << " cp)\n"
-                          << "Arama değerlendirmesi: " << Eval::to_cp(Eval::evaluate(pos, ev)) << " cp" << std::endl;
+                const NNUE::Output raw = ev.evaluate(pos);
+                std::cout << "NNUE (ham, sıra gelen taraf): psqt " << raw.psqt << " + katmanlar " << raw.positional
+                          << " = " << raw.sum() << "  (" << Eval::to_cp(raw.sum(), pos) << " cp)\n"
+                          << "Arama değerlendirmesi: " << Eval::to_cp(Eval::evaluate(pos, ev), pos) << " cp" << std::endl;
             }
         } else if (!token.empty())
             std::cout << "info string bilinmeyen komut: " << token << std::endl;
@@ -214,7 +215,7 @@ void bench(int depth, int threads, int hashMb) {
         Threads.main()->wait_for_search_finished();
         totalNodes += Threads.nodes_searched();
         std::cout << "  " << fen << "  -> " << move_to_uci(Threads.main()->rootMoves[0].pv[0]) << " "
-                  << uci_score(Threads.main()->rootMoves[0].score) << "\n";
+                  << uci_score(Threads.main()->rootMoves[0].score, pos) << "\n";
     }
     TimePoint ms = std::max<TimePoint>(now() - start, 1);
     Threads.silent = false;

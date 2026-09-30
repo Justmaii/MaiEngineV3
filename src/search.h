@@ -164,6 +164,6 @@ private:
 
 extern ThreadPool Threads;
 
-std::string uci_score(Value v);
+std::string uci_score(Value v, const Position& pos);
 
 }  // namespace mai

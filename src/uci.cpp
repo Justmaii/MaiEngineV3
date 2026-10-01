@@ -204,6 +204,8 @@ void bench(int depth, int threads, int hashMb) {
     Search::clear();
 
     uint64_t totalNodes = 0;
+    const NNUE::Evaluator& ev = Threads.main()->evaluator;  // istatistik ana iş parçacığından
+    const uint64_t evals0 = ev.evals, refreshes0 = ev.refreshes, updates0 = ev.updates, rows0 = ev.rows;
     TimePoint start = now();
     Position pos;
     for (const char* fen : Fens) {
@@ -222,7 +224,13 @@ void bench(int depth, int threads, int hashMb) {
     std::cout << "==========================\n"
               << "Toplam süre (ms) : " << ms << "\n"
               << "Düğüm            : " << totalNodes << "\n"
-              << "Düğüm/saniye     : " << totalNodes * 1000 / ms << std::endl;
+              << "Düğüm/saniye     : " << totalNodes * 1000 / ms << "\n";
+    if (threads == 1)
+        std::cout << "Değerlendirme    : " << ev.evals - evals0 << " (düğüm başına "
+                  << double(ev.evals - evals0) / std::max<uint64_t>(totalNodes, 1) << ")\n"
+                  << "Accumulator      : " << ev.updates - updates0 << " güncelleme, " << ev.refreshes - refreshes0
+                  << " tazeleme, " << ev.rows - rows0 << " int8 satır\n";
+    std::cout << std::flush;
 }
 
 }  // namespace mai::UCI

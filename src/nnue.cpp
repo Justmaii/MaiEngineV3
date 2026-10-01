@@ -135,49 +135,10 @@ bool init_tables() {
     return cumulative == uint32_t(ThreatDims);
 }
 
-// Ham tehdit: saldıran | hedef<<4 | kaynak<<8 | hedef kare<<14 (bakıştan bağımsız)
-inline uint32_t pack_threat(Piece a, Square from, Square to, Piece d) {
-    return uint32_t(a) | uint32_t(d) << 4 | uint32_t(from) << 8 | uint32_t(to) << 14;
-}
-
 inline uint32_t threat_index(uint32_t raw, int orient, int swap) {
     const int a = int(raw & 15) ^ swap, d = int((raw >> 4) & 15) ^ swap;
     const int f = int((raw >> 8) & 63) ^ orient, t = int((raw >> 14) & 63) ^ orient;
     return ThreatLut1[a][d][f < t] + ThreatOffsets[a][f] + ThreatLut2[a][f][t];
-}
-
-// Pozisyondaki tüm tehditleri sıralı listeye yaz
-void collect_threats(const Position& pos, ThreatState& ts) {
-    const Bitboard occ = pos.pieces();
-    const Bitboard pawnTargets = pos.pieces(KNIGHT, ROOK);
-    const Bitboard minorSliderTargets = pos.pieces(PAWN, KNIGHT) | pos.pieces(BISHOP, ROOK);
-    const Bitboard queenTargets = minorSliderTargets | pos.pieces(QUEEN);
-    int n = 0;
-    auto push = [&](Piece a, Square from, Square to) {
-        if (n < MaxThreats) ts.list[n++] = pack_threat(a, from, to, pos.piece_on(to));
-    };
-
-    const Bitboard wp = pos.pieces(WHITE, PAWN), bp = pos.pieces(BLACK, PAWN);
-    for (Bitboard b = shift<NORTH_EAST>(wp) & pawnTargets; b;) { Square to = pop_lsb(b); push(W_PAWN, Square(to - 9), to); }
-    for (Bitboard b = shift<NORTH_WEST>(wp) & pawnTargets; b;) { Square to = pop_lsb(b); push(W_PAWN, Square(to - 7), to); }
-    for (Bitboard b = shift<SOUTH_WEST>(bp) & pawnTargets; b;) { Square to = pop_lsb(b); push(B_PAWN, Square(to + 9), to); }
-    for (Bitboard b = shift<SOUTH_EAST>(bp) & pawnTargets; b;) { Square to = pop_lsb(b); push(B_PAWN, Square(to + 7), to); }
-
-    for (Color c : {WHITE, BLACK})
-        for (PieceType pt = KNIGHT; pt < KING; pt = PieceType(pt + 1)) {
-            const Piece a = make_piece(c, pt);
-            const Bitboard targets = pt == KNIGHT || pt == QUEEN ? queenTargets : minorSliderTargets;
-            for (Bitboard b = pos.pieces(c, pt); b;) {
-                const Square from = pop_lsb(b);
-                for (Bitboard t = attacks_bb(pt, from, occ) & targets; t;) push(a, from, pop_lsb(t));
-            }
-        }
-
-    std::sort(ts.list, ts.list + n);
-    ts.count = n;
-    ts.pawns[WHITE] = wp;
-    ts.pawns[BLACK] = bp;
-    ts.key = pos.key();
 }
 
 inline uint32_t pair_index(Color persp, int orient, Color ca, Square a, Color cb, Square b) {
@@ -190,7 +151,7 @@ inline uint32_t pair_index(Color persp, int orient, Color ca, Square a, Color cb
 // "Diğer" bloğun (tehdit + piyon çifti) indeks listesi. Eklenen satırın ağırlıkları
 // önceden önbelleğe istenir: 66 MB'lık tabloda rastgele erişim, asıl maliyet bekleme.
 struct IndexList {
-    uint32_t v[2 * MaxThreats + 512];
+    uint32_t v[MaxSpan * MaxThreatChanges + 512];
     int n = 0;
     void push(uint32_t i) {
         __builtin_prefetch(net->otherWeight + size_t(i) * HalfDims);
@@ -198,13 +159,13 @@ struct IndexList {
     }
 };
 
-void active_other(Color persp, Square ksq, const ThreatState& ts, IndexList& out) {
+void active_other(Color persp, Square ksq, const uint32_t* threats, int n, const Bitboard* pawns, IndexList& out) {
     const int orient = other_orient(persp, ksq), swap = 8 * persp;
-    for (int i = 0; i < ts.count; ++i) {
-        const uint32_t idx = threat_index(ts.list[i], orient, swap);
+    for (int i = 0; i < n; ++i) {
+        const uint32_t idx = threat_index(threats[i], orient, swap);
         if (idx < uint32_t(ThreatDims)) out.push(idx);
     }
-    const Bitboard white = ts.pawns[WHITE], black = ts.pawns[BLACK];
+    const Bitboard white = pawns[WHITE], black = pawns[BLACK];
     for (Bitboard b = white; b;) {
         const Square from = pop_lsb(b);
         for (Bitboard p = PawnPairBB[from] & b; p;) out.push(pair_index(persp, orient, WHITE, from, WHITE, pop_lsb(p)));
@@ -214,6 +175,13 @@ void active_other(Color persp, Square ksq, const ThreatState& ts, IndexList& out
         const Square from = pop_lsb(b);
         for (Bitboard p = PawnPairBB[from] & b; p;) out.push(pair_index(persp, orient, BLACK, from, BLACK, pop_lsb(p)));
     }
+}
+
+void active_other(Color persp, Square ksq, const Position& pos, IndexList& out) {
+    uint32_t list[2 * MaxThreats];
+    const int n = pos.all_threats(list, 2 * MaxThreats);
+    const Bitboard pawns[COLOR_NB] = {pos.pieces(WHITE, PAWN), pos.pieces(BLACK, PAWN)};
+    active_other(persp, ksq, list, n, pawns, out);
 }
 
 // İki pozisyon arasında değişen piyon çiftleri: en az bir üyesi değişmiş çiftler
@@ -228,28 +196,49 @@ void pair_changes(Color persp, int orient, Bitboard updW, Bitboard updB, Bitboar
     }
 }
 
-void other_changes(Color persp, Square ksq, const ThreatState& before, const ThreatState& after, IndexList& added,
+// (from, to] hamlelerinin tehdit değişikliklerini topla, birbirini götürenleri at,
+// bu bakışın indekslerine çevir. Piyon çiftleri iki uçtaki piyonların farkından.
+// Bir hamlenin listesi taşmışsa false (çağıran baştan hesaplar).
+bool other_changes(const Position& pos, int from, int to, Color persp, Square ksq, IndexList& added,
                    IndexList& removed) {
-    const int orient = other_orient(persp, ksq), swap = 8 * persp;
-    auto emit = [&](uint32_t raw, IndexList& out) {
-        const uint32_t idx = threat_index(raw, orient, swap);
-        if (idx < uint32_t(ThreatDims)) out.push(idx);
-    };
-    // İki sıralı listenin farkı
-    int i = 0, j = 0;
-    while (i < before.count && j < after.count) {
-        if (before.list[i] == after.list[j]) ++i, ++j;
-        else if (before.list[i] < after.list[j]) emit(before.list[i++], removed);
-        else emit(after.list[j++], added);
+    uint32_t buf[MaxSpan * MaxThreatChanges];
+    int n = 0;
+    for (int k = from + 1; k <= to; ++k) {
+        const ThreatDelta& d = pos.threat_delta(k);
+        if (d.overflow) return false;
+        std::memcpy(buf + n, d.raw, sizeof(uint32_t) * d.count);
+        n += d.count;
     }
-    while (i < before.count) emit(before.list[i++], removed);
-    while (j < after.count) emit(after.list[j++], added);
+    // Aynı tehdidin eklenip kalkması birbirini götürür (ör. alışta açılıp kapanan ışın)
+    auto key = [](uint32_t r) { return r & ~ThreatAdded; };
+    if (n <= 32)
+        for (int i = 1; i < n; ++i) {  // küçük listede eklemeli sıralama
+            const uint32_t v = buf[i];
+            int k = i - 1;
+            for (; k >= 0 && key(buf[k]) > key(v); --k) buf[k + 1] = buf[k];
+            buf[k + 1] = v;
+        }
+    else
+        std::sort(buf, buf + n, [&](uint32_t a, uint32_t b) { return key(a) < key(b); });
 
-    const Bitboard bw = before.pawns[WHITE], bb = before.pawns[BLACK];
-    const Bitboard aw = after.pawns[WHITE], ab = after.pawns[BLACK];
-    if (bw == aw && bb == ab) return;
-    pair_changes(persp, orient, aw & ~bw, ab & ~bb, aw, ab, added);
-    pair_changes(persp, orient, bw & ~aw, bb & ~ab, bw, bb, removed);
+    const int orient = other_orient(persp, ksq), swap = 8 * persp;
+    for (int i = 0; i < n;) {
+        int balance = 0, k = i;
+        for (; k < n && key(buf[k]) == key(buf[i]); ++k) balance += (buf[k] & ThreatAdded) ? 1 : -1;
+        if (balance) {
+            const uint32_t idx = threat_index(buf[i], orient, swap);
+            if (idx < uint32_t(ThreatDims)) (balance > 0 ? added : removed).push(idx);
+        }
+        i = k;
+    }
+
+    const ThreatDelta &a = pos.threat_delta(from), &b = pos.threat_delta(to);
+    const Bitboard bw = a.pawns[WHITE], bb = a.pawns[BLACK], aw = b.pawns[WHITE], ab = b.pawns[BLACK];
+    if (bw != aw || bb != ab) {
+        pair_changes(persp, orient, aw & ~bw, ab & ~bb, aw, ab, added);
+        pair_changes(persp, orient, bw & ~aw, bb & ~ab, bw, bb, removed);
+    }
+    return true;
 }
 
 // ---------------- Vektör yardımcıları ----------------
@@ -607,8 +596,6 @@ bool load(const std::string& path, std::string* err) {
 Output evaluate_scratch(const Position& pos) {
     alignas(64) int16_t acc[COLOR_NB][HalfDims];
     int32_t psqt[COLOR_NB][PsqtBuckets];
-    auto ts = std::make_unique<ThreatState>();
-    collect_threats(pos, *ts);
     auto list = std::make_unique<IndexList>();
     IndexList none;
     for (Color p : {WHITE, BLACK}) {
@@ -622,7 +609,7 @@ Output evaluate_scratch(const Position& pos) {
             add_psqt(psqt[p], net->psqPsqt + size_t(idx) * PsqtBuckets);
         }
         list->n = 0;
-        active_other(p, pos.king_square(p), *ts, *list);
+        active_other(p, pos.king_square(p), pos, *list);
         apply_other(acc[p], psqt[p], *list, none);
     }
     const Color us = pos.side_to_move();
@@ -635,14 +622,9 @@ Evaluator::Evaluator() { clear(); }
 
 void Evaluator::clear() {
     stack.assign(256, Accumulator{});
-    threats.assign(256, ThreatState{});
     finny.assign(size_t(COLOR_NB) * SQUARE_NB, FinnyEntry{});
     if (net)
         for (auto& e : finny) std::memcpy(e.acc, net->ftBias, sizeof(e.acc));  // boş tahta = sadece bias
-}
-
-void Evaluator::ensure_threats(const Position& pos, int idx) {
-    if (threats[idx].key != pos.key()) collect_threats(pos, threats[idx]);
 }
 
 // Finny tablosundan HalfKA kısmı: kayıtlı dizilimle şimdiki arasındaki farkı uygula
@@ -652,6 +634,7 @@ void Evaluator::refresh_psq(const Position& pos, int idx, Color persp) {
     FinnyEntry& e = finny[int(persp) * SQUARE_NB + int(ksq)];
     FeatureCtx ctx(persp, ksq);
 
+    // En fazla 32 taş çıkar + 32 taş girer, 64'lük diziler yeter
     RowDelta d;
     const int32_t* addP[64];
     const int32_t* subP[64];
@@ -662,18 +645,15 @@ void Evaluator::refresh_psq(const Position& pos, int idx, Color persp) {
             const Piece pc = make_piece(c, pt);
             for (Bitboard b = oldBB & ~newBB; b;) {
                 const int i = ctx.index(pop_lsb(b), pc);
-                if (d.nSub16 == 64) break;
                 subP[d.nSub16] = net->psqPsqt + size_t(i) * PsqtBuckets;
                 d.sub16[d.nSub16++] = net->psqWeight + size_t(i) * HalfDims;
             }
             for (Bitboard b = newBB & ~oldBB; b;) {
                 const int i = ctx.index(pop_lsb(b), pc);
-                if (d.nAdd16 == 64) break;
                 addP[d.nAdd16] = net->psqPsqt + size_t(i) * PsqtBuckets;
                 d.add16[d.nAdd16++] = net->psqWeight + size_t(i) * HalfDims;
             }
         }
-    // En fazla 32 taş çıkar + 32 taş girer, 64'lük diziler yeter
     apply_delta(e.acc, e.acc, d);
     apply_delta_psqt(e.psqt, e.psqt, d, addP, subP);
     for (Color c : {WHITE, BLACK}) e.byColor[c] = pos.pieces(c);
@@ -684,64 +664,61 @@ void Evaluator::refresh_psq(const Position& pos, int idx, Color persp) {
     std::memcpy(acc.psqtPsq[persp], e.psqt, sizeof(e.psqt));
 }
 
-// Tembel güncelleme: geriye doğru hesaplanmış en yakın ataya git.
-//  - HalfKA: yolda bu bakışın şahı oynadıysa (kova/ayna değişir) Finny tablosundan
-//    tazele, yoksa yol üzerindeki taş değişimlerini uygula.
-//  - Tehdit + piyon çifti: sadece yöne (şahın tahtanın hangi yarısında olduğu)
-//    bağlı. Yön aynıysa ata ile şimdiki pozisyonun listelerinin farkını uygula,
-//    değiştiyse (şah ortayı geçti) etkin listeden sıfırdan topla.
-void Evaluator::update(const Position& pos, int idx, Color persp) {
-    auto valid = [&](int j) {
-        const Key k = pos.state_at(j).key;
-        return stack[j].key[persp] == k && threats[j].key == k;
-    };
-    if (valid(idx)) return;
+// Tehdit + piyon çifti kısmını şimdiki tahtadan sıfırdan topla
+void Evaluator::refresh_threats(const Position& pos, int idx, Color persp) {
+    RowDelta d;
+    active_other(persp, pos.king_square(persp), pos, d.add8);
+    rows += d.add8.n;
+    Accumulator& acc = stack[idx];
+    apply_delta(acc.thr[persp], Zero16, d);
+    const int32_t zero[PsqtBuckets] = {};
+    apply_delta_psqt(acc.psqtThr[persp], zero, d, nullptr, nullptr);
+}
 
-    constexpr int MaxSpan = 16;  // daha uzak ata varsa baştan kurmak daha ucuz
-    const Square ksq = pos.king_square(persp);
-    Accumulator& out = stack[idx];
-    int j = idx;
+// stack[from] hesaplıyken stack[to]'yu (from < to) hesapla. Ara hamlelerin tahtası
+// elimizde yok: şah yolda oynadıysa ya da bir fark listesi taştıysa sadece to ==
+// şimdiki pozisyonken yapılabilir (Finny / sıfırdan); değilse false.
+bool Evaluator::step(const Position& pos, int from, int to, Color persp) {
+    const bool current = to == pos.state_index();
+    const Square ksq = pos.threat_delta(to).ksq[persp];
     bool kingMoved = false;
-    while (!valid(j)) {
-        if (j == 0 || idx - j >= MaxSpan) {
-            // Kullanılabilir ata yok: ikisini de baştan
-            refresh_psq(pos, idx, persp);
-            RowDelta d;
-            active_other(persp, ksq, threats[idx], d.add8);
-            rows += d.add8.n;
-            apply_delta(out.thr[persp], Zero16, d);
-            const int32_t zero[PsqtBuckets] = {};
-            apply_delta_psqt(out.psqtThr[persp], zero, d, nullptr, nullptr);
-            out.key[persp] = pos.state_at(idx).key;
-            out.ksq[persp] = ksq;
-            return;
-        }
-        const DirtyPiece& dp = pos.state_at(j).dirty;
-        if (dp.count && dp.piece[0] == make_piece(persp, KING)) kingMoved = true;
-        --j;
-    }
-    const Accumulator& in = stack[j];
+    for (int k = from + 1; k <= to; ++k) kingMoved |= pos.threat_delta(k).ksq[persp] != pos.threat_delta(k - 1).ksq[persp];
+    const bool longSpan = to - from > MaxSpan;
+    if ((kingMoved || longSpan) && !current) return false;
 
-    // HalfKA kısmı
-    if (kingMoved) refresh_psq(pos, idx, persp);
+    Accumulator& out = stack[to];
+    const Accumulator& in = stack[from];
+
+    // Tehdit + piyon çifti: yön (şahın tahtanın hangi yarısında olduğu) aynıysa fark
+    RowDelta dt;
+    const bool sameOrient = other_orient(persp, in.ksq[persp]) == other_orient(persp, ksq) && !longSpan;
+    if (sameOrient && other_changes(pos, from, to, persp, ksq, dt.add8, dt.sub8)) {
+        rows += dt.add8.n + dt.sub8.n;
+        apply_delta(out.thr[persp], in.thr[persp], dt);
+        apply_delta_psqt(out.psqtThr[persp], in.psqtThr[persp], dt, nullptr, nullptr);
+    } else if (current)
+        refresh_threats(pos, to, persp);
+    else
+        return false;
+
+    // HalfKA: şah oynadıysa (ya da yol uzunsa) Finny tablosundan, yoksa yoldaki taş değişimleri
+    if (kingMoved || longSpan) refresh_psq(pos, to, persp);
     else {
         ++updates;
-        FeatureCtx ctx(persp, ksq);  // şah bu yolda oynamadı, kare aynı
+        FeatureCtx ctx(persp, ksq);
         RowDelta d;
-        const int32_t* addP[64];
-        const int32_t* subP[64];
-        for (int k = j + 1; k <= idx; ++k) {
+        const int32_t* addP[3 * MaxSpan];
+        const int32_t* subP[3 * MaxSpan];
+        for (int k = from + 1; k <= to; ++k) {
             const DirtyPiece& dp = pos.state_at(k).dirty;
             for (int i = 0; i < dp.count; ++i) {
                 if (dp.from[i] != SQ_NONE) {
                     const int f = ctx.index(dp.from[i], dp.piece[i]);
-                    __builtin_prefetch(net->psqWeight + size_t(f) * HalfDims);
                     subP[d.nSub16] = net->psqPsqt + size_t(f) * PsqtBuckets;
                     d.sub16[d.nSub16++] = net->psqWeight + size_t(f) * HalfDims;
                 }
                 if (dp.to[i] != SQ_NONE) {
                     const int t = ctx.index(dp.to[i], dp.piece[i]);
-                    __builtin_prefetch(net->psqWeight + size_t(t) * HalfDims);
                     addP[d.nAdd16] = net->psqPsqt + size_t(t) * PsqtBuckets;
                     d.add16[d.nAdd16++] = net->psqWeight + size_t(t) * HalfDims;
                 }
@@ -750,32 +727,37 @@ void Evaluator::update(const Position& pos, int idx, Color persp) {
         apply_delta(out.psq[persp], in.psq[persp], d);
         apply_delta_psqt(out.psqtPsq[persp], in.psqtPsq[persp], d, addP, subP);
     }
-
-    // Tehdit + piyon çifti kısmı
-    RowDelta d;
-    if (other_orient(persp, in.ksq[persp]) == other_orient(persp, ksq)) {
-        other_changes(persp, ksq, threats[j], threats[idx], d.add8, d.sub8);
-        rows += d.add8.n + d.sub8.n;
-        apply_delta(out.thr[persp], in.thr[persp], d);
-        apply_delta_psqt(out.psqtThr[persp], in.psqtThr[persp], d, nullptr, nullptr);
-    } else {
-        active_other(persp, ksq, threats[idx], d.add8);
-        rows += d.add8.n;
-        apply_delta(out.thr[persp], Zero16, d);
-        const int32_t zero[PsqtBuckets] = {};
-        apply_delta_psqt(out.psqtThr[persp], zero, d, nullptr, nullptr);
-    }
-    out.key[persp] = pos.state_at(idx).key;
+    out.key[persp] = pos.state_at(to).key;
     out.ksq[persp] = ksq;
+    return true;
+}
+
+// Tembel güncelleme: geriye doğru hesaplanmış en yakın ataya git, oradan ileri her
+// hamleyi tek tek hesaplayıp sakla (Stockfish gibi). Böylece bu yolun altındaki
+// diğer düğümler de tek hamlelik farkla başlar; aynı uzun fark tekrar tekrar
+// hesaplanmaz (ör. iterative deepening'de TT'den değer alan düğümlerin altı).
+// Ara hamlede şah oynadıysa oradan sonrası şimdiki pozisyonda tek adımda yapılır.
+void Evaluator::update(const Position& pos, int idx, Color persp) {
+    auto valid = [&](int j) { return stack[j].key[persp] == pos.state_at(j).key; };
+    if (valid(idx)) return;
+
+    int j = idx - 1;
+    while (j >= 0 && !valid(j)) --j;
+    if (j < 0) {  // kullanılabilir ata yok: baştan
+        refresh_psq(pos, idx, persp);
+        refresh_threats(pos, idx, persp);
+        stack[idx].key[persp] = pos.state_at(idx).key;
+        stack[idx].ksq[persp] = pos.king_square(persp);
+        return;
+    }
+    while (j + 1 < idx && step(pos, j, j + 1, persp)) ++j;
+    step(pos, j, idx, persp);
 }
 
 Output Evaluator::evaluate(const Position& pos) {
+    ++evals;
     const int idx = pos.state_index();
-    if (int(stack.size()) <= idx) {
-        stack.resize(idx + 256);
-        threats.resize(idx + 256);
-    }
-    ensure_threats(pos, idx);
+    if (int(stack.size()) <= idx) stack.resize(idx + 256);
     update(pos, idx, WHITE);
     update(pos, idx, BLACK);
     const Accumulator& a = stack[idx];

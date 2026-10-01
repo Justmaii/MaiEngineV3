@@ -27,6 +27,27 @@ struct DirtyPiece {
     Square to[3];
 };
 
+// Tehdit: "a taşı (from'da) d taşına (to'da) saldırıyor" (NNUE FullThreats girdisi).
+// Şahlar ne saldıran ne hedef sayılır ama ışınları keser. Ham kodlama:
+// saldıran | hedef<<4 | kaynak<<8 | hedef kare<<14, bit 31 = eklendi (yoksa kalktı)
+constexpr uint32_t ThreatAdded = 1u << 31;
+inline uint32_t pack_threat(Piece a, Square from, Square to, Piece d) {
+    return uint32_t(a) | uint32_t(d) << 4 | uint32_t(from) << 8 | uint32_t(to) << 14;
+}
+
+// Bir hamlenin tehditlerde yaptığı değişiklik (NNUE'nin artımlı güncellemesi için),
+// ve hamleden sonraki piyonlar ile şah kareleri. Değişiklikler sırayla, tahtanın o
+// anki haline göre yazılır; aynı tehdit hem kalkıp hem eklenebilir (birbirini götürür).
+constexpr int MaxThreatChanges = 128;
+struct ThreatDelta {
+    int count;
+    bool overflow;  // sığmadıysa NNUE sıfırdan hesaplar
+    uint32_t raw[MaxThreatChanges];
+    Bitboard pawns[COLOR_NB];
+    Square ksq[COLOR_NB];
+    ThreatDelta() {}  // bilerek sıfırlanmaz: her hamlede doldurulur
+};
+
 // Hamleyle geri alınamayan bilgiler; her hamlede yığına bir kopya eklenir.
 struct StateInfo {
     DirtyPiece dirty;
@@ -82,6 +103,9 @@ public:
     // Durum yığınındaki mutlak indeks (NNUE accumulator yığını bununla eşleşir)
     int state_index() const { return int(states.size()) - 1; }
     const StateInfo& state_at(int idx) const { return states[idx]; }
+    const ThreatDelta& threat_delta(int idx) const { return deltas[idx]; }
+    // Tahtadaki tüm tehditler (ham kodlama, sırasız); en fazla max tane yazar, sayıyı döner
+    int all_threats(uint32_t* out, int max) const;
     Key key() const { return state().key; }
     Key pawn_key() const { return state().pawnKey; }
     Bitboard checkers() const { return state().checkers; }
@@ -136,6 +160,13 @@ private:
     void put_piece(Piece pc, Square s);
     void remove_piece(Square s);
     void move_piece(Square from, Square to);
+    // Tehdit değişikliklerini de yazan sürümler (do_move için)
+    void put_piece(Piece pc, Square s, ThreatDelta& d);
+    void remove_piece(Square s, ThreatDelta& d);
+    void move_piece(Square from, Square to, ThreatDelta& d);
+    void threats_of(Piece pc, Square s, uint32_t added, ThreatDelta& d) const;
+    void rays_through(Square s, uint32_t added, ThreatDelta& d) const;
+    ThreatDelta& new_delta();
     void set_check_info(StateInfo& st) const;
     void update_slider_blockers(StateInfo& st, Color c) const;
 
@@ -146,6 +177,7 @@ private:
     Color sideToMove;
     int gamePly;
     std::vector<StateInfo> states;
+    std::vector<ThreatDelta> deltas;  // states ile aynı indeks
 };
 
 std::string square_to_string(Square s);

@@ -53,25 +53,33 @@ bool load_net(const std::string& given = "") {
     return false;
 }
 
-// Artımlı güncellemeyi sına: rastgele oyunlarda her düğümde sıfırdan hesapla karşılaştır.
-// Ağaç içinde ileri-geri giderek tembel yığının atalarını ve Finny tablosunu da zorlar.
+// Artımlı güncellemeyi sına: rastgele oyunlarda düğümlerde sıfırdan hesapla karşılaştır.
+// Ağaç içinde ileri-geri giderek tembel yığının atalarını ve Finny tablosunu zorlar;
+// düğümlerin bir kısmı değerlendirilmeden geçilir (çok hamlelik yollar, ara hamle
+// saklama) ve ara sıra null move yapılır.
 uint64_t nnue_incremental_check(Position& pos, NNUE::Evaluator& ev, int depth, PRNG& rng, uint64_t& nodes) {
     ++nodes;
     uint64_t errors = 0;
-    const NNUE::Output a = ev.evaluate(pos), b = NNUE::evaluate_scratch(pos);
-    if (a.psqt != b.psqt || a.positional != b.positional) {
-        if (errors++ < 5)
-            std::cout << "HATA: artımlı " << a.psqt << "/" << a.positional << " != sıfırdan " << b.psqt << "/"
-                      << b.positional << "  " << pos.fen() << "\n";
+    if (depth == 0 || rng.rand64() % 3 == 0) {
+        const NNUE::Output a = ev.evaluate(pos), b = NNUE::evaluate_scratch(pos);
+        if (a.psqt != b.psqt || a.positional != b.positional) {
+            if (errors++ < 5)
+                std::cout << "HATA: artımlı " << a.psqt << "/" << a.positional << " != sıfırdan " << b.psqt << "/"
+                          << b.positional << "  " << pos.fen() << "\n";
+        }
     }
     if (depth == 0) return errors;
+    if (!pos.checkers() && rng.rand64() % 8 == 0) {
+        pos.do_null_move();
+        errors += nnue_incremental_check(pos, ev, depth - 1, rng, nodes);
+        pos.undo_null_move();
+    }
     MoveList<LEGAL> moves(pos);
     int n = 0;
     for (const auto& em : moves) {
         if (rng.rand64() % 4 && n > 0) continue;  // dalların bir kısmı
         ++n;
         pos.do_move(em.move);
-        // Bazen bu düğümü değerlendirmeden derine in (tembel yolu sına)
         errors += nnue_incremental_check(pos, ev, depth - 1, rng, nodes);
         pos.undo_move(em.move);
     }
@@ -203,7 +211,7 @@ int main(int argc, char** argv) {
                                 "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
                                 "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8"}) {
             pos.set(fen);
-            errors += nnue_incremental_check(pos, ev, 5, rng, nodes);
+            errors += nnue_incremental_check(pos, ev, 6, rng, nodes);
         }
         std::cout << "Artımlı kontrol: " << nodes << " düğüm, " << errors << " hata (tazeleme " << ev.refreshes
                   << ", güncelleme " << ev.updates << ")\n";

@@ -30,6 +30,7 @@ constexpr int L2 = 32;  // fc0 çıkışı (son ikisi farkı doğrudan çıkış
 constexpr int L3 = 32;  // fc1 çıkışı
 
 constexpr int MaxThreats = 256;  // bir pozisyondaki etkin tehdit sayısı sınırı
+constexpr int MaxSpan = 8;       // ata bundan uzaksa baştan kurmak daha ucuz
 
 constexpr const char* DefaultNetName = "nn-1a298aa575a0.nnue";
 
@@ -57,15 +58,6 @@ struct alignas(64) Accumulator {
     Square ksq[COLOR_NB];   // hesaplandığında bakışın şah karesi
 };
 
-// Bir pozisyonun bakıştan bağımsız tehdit listesi (sıralı) ve piyonları.
-// Atayla şimdiki pozisyon arasındaki fark, eklenecek/çıkarılacak özellikleri verir.
-struct ThreatState {
-    Key key = 0;
-    int count = 0;
-    Bitboard pawns[COLOR_NB] = {};
-    uint32_t list[MaxThreats];
-};
-
 // Finny tablosu: her (bakış, şah karesi) için en son görülen taş dizilimi ve
 // HalfKA toplamı. Şah oynayınca sıfırdan toplamak yerine sadece farkları uygularız.
 struct alignas(64) FinnyEntry {
@@ -83,16 +75,16 @@ public:
     void clear();  // Finny tablosunu ve yığını sıfırla (yeni oyun)
 
     // İstatistik (hız profili için)
-    uint64_t refreshes = 0, updates = 0, rows = 0;  // rows: uygulanan int8 satır sayısı
+    uint64_t evals = 0, refreshes = 0, updates = 0, rows = 0;  // rows: uygulanan int8 satır sayısı
 
 private:
-    void ensure_threats(const Position& pos, int idx);
     void update(const Position& pos, int idx, Color persp);
+    bool step(const Position& pos, int from, int to, Color persp);
     void refresh_psq(const Position& pos, int idx, Color persp);
+    void refresh_threats(const Position& pos, int idx, Color persp);
 
-    std::vector<Accumulator> stack;   // pos.state_index() ile indekslenir
-    std::vector<ThreatState> threats;  // aynı indeksle
-    std::vector<FinnyEntry> finny;     // [renk][şah karesi]
+    std::vector<Accumulator> stack;  // pos.state_index() ile indekslenir
+    std::vector<FinnyEntry> finny;   // [renk][şah karesi]
 };
 
 // Test/karşılaştırma için: accumulator kullanmadan sıfırdan değerlendirme

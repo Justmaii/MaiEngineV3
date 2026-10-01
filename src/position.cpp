@@ -86,6 +86,90 @@ void Position::move_piece(Square from, Square to) {
     board[to] = pc;
 }
 
+// ---------------- Tehdit değişiklikleri (NNUE) ----------------
+// Tahtadaki tehdit kümesi, s karesindeki pc eklenip çıkınca tam olarak şunlar kadar değişir:
+//  (a) pc'nin saldırdığı taşlar, (b) pc'ye saldıran taşlar  (pc tahtadayken hesaplanır)
+//  (c) s'den geçen ışınlar: s'ye saldıran her kaydıran X, s'nin ötesindeki ilk taşı Y
+//      görür/görmez. s'nin dolu olup olmaması bu hesabı değiştirmez.
+// Şahlar tehdit oluşturmaz ve hedef olmaz, ama ışın keser.
+inline void push_threat(ThreatDelta& d, uint32_t raw) {
+    if (d.count < MaxThreatChanges) d.raw[d.count++] = raw;
+    else d.overflow = true;
+}
+
+void Position::threats_of(Piece pc, Square s, uint32_t added, ThreatDelta& d) const {
+    const PieceType pt = type_of(pc);
+    if (pt == KING) return;
+    const Bitboard occ = pieces(), targets = occ & ~pieces(KING);
+    const Bitboard att = pt == PAWN ? pawn_attacks(color_of(pc), s) : attacks_bb(pt, s, occ);
+    for (Bitboard b = att & targets; b;) {
+        const Square t = pop_lsb(b);
+        push_threat(d, pack_threat(pc, s, t, board[t]) | added);
+    }
+    for (Bitboard b = attackers_to(s, occ) & targets; b;) {
+        const Square a = pop_lsb(b);
+        push_threat(d, pack_threat(board[a], a, s, pc) | added);
+    }
+}
+
+void Position::rays_through(Square s, uint32_t added, ThreatDelta& d) const {
+    const Bitboard occ = pieces(), targets = occ & ~pieces(KING);
+    const Bitboard rookRay = attacks_bb<ROOK>(s, occ), bishopRay = attacks_bb<BISHOP>(s, occ);
+    auto beyond = [&](Bitboard sliders, Bitboard ray) {
+        for (Bitboard b = sliders & ray; b;) {
+            const Square x = pop_lsb(b);
+            // s'den, x'in tersi yönde ilk taş
+            const Bitboard y = ray & line_bb(x, s) & ~between_bb(x, s) & ~square_bb(x) & targets;
+            if (y) push_threat(d, pack_threat(board[x], x, lsb(y), board[lsb(y)]) | added);
+        }
+    };
+    beyond(pieces(ROOK, QUEEN), rookRay);
+    beyond(pieces(BISHOP, QUEEN), bishopRay);
+}
+
+void Position::put_piece(Piece pc, Square s, ThreatDelta& d) {
+    rays_through(s, 0, d);  // s artık ışınları kesiyor
+    put_piece(pc, s);
+    threats_of(pc, s, ThreatAdded, d);
+}
+
+void Position::remove_piece(Square s, ThreatDelta& d) {
+    threats_of(board[s], s, 0, d);
+    remove_piece(s);
+    rays_through(s, ThreatAdded, d);  // s'den geçen ışınlar açıldı
+}
+
+void Position::move_piece(Square from, Square to, ThreatDelta& d) {
+    const Piece pc = board[from];
+    remove_piece(from, d);
+    put_piece(pc, to, d);
+}
+
+int Position::all_threats(uint32_t* out, int max) const {
+    const Bitboard occ = pieces(), targets = occ & ~pieces(KING);
+    int n = 0;
+    for (Bitboard b = targets; b;) {
+        const Square s = pop_lsb(b);
+        const Piece pc = board[s];
+        const PieceType pt = type_of(pc);
+        const Bitboard att = pt == PAWN ? pawn_attacks(color_of(pc), s) : attacks_bb(pt, s, occ);
+        for (Bitboard t = att & targets; t;) {
+            const Square to = pop_lsb(t);
+            if (n < max) out[n++] = pack_threat(pc, s, to, board[to]);
+        }
+    }
+    return n;
+}
+
+ThreatDelta& Position::new_delta() {
+    const size_t idx = states.size();  // eklenecek durumun indeksi
+    if (deltas.size() <= idx) deltas.resize(idx + 64);
+    ThreatDelta& d = deltas[idx];
+    d.count = 0;
+    d.overflow = false;
+    return d;
+}
+
 bool Position::set(const std::string& fen) {
     std::memset(board, 0, sizeof(board));
     std::memset(byTypeBB, 0, sizeof(byTypeBB));
@@ -142,6 +226,12 @@ bool Position::set(const std::string& fen) {
             && (pieces(~us, PAWN) & square_bb(eps - pawn_push(us)))
             && empty(eps) && empty(eps + pawn_push(us)))
             st.epSquare = eps;
+    }
+
+    ThreatDelta& d0 = new_delta();
+    for (Color c : {WHITE, BLACK}) {
+        d0.pawns[c] = pieces(c, PAWN);
+        d0.ksq[c] = king_square(c);
     }
 
     st.rule50 = rule50;
@@ -226,6 +316,7 @@ void Position::do_move(Move m) {
     ++st.rule50;
     ++st.pliesFromNull;
     st.captured = captured;
+    ThreatDelta& td = new_delta();
     DirtyPiece& dp = st.dirty;
     dp.count = 1;
     dp.piece[0] = pc;
@@ -237,8 +328,10 @@ void Position::do_move(Move m) {
         const Square rfrom = relative_square(us, kingSide ? SQ_H1 : SQ_A1);
         const Square rto = relative_square(us, kingSide ? SQ_F1 : SQ_D1);
         const Piece rook = make_piece(us, ROOK);
-        move_piece(from, to);
-        move_piece(rfrom, rto);
+        remove_piece(from, td);
+        remove_piece(rfrom, td);
+        put_piece(pc, to, td);
+        put_piece(rook, rto, td);
         k ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to] ^ Zobrist::psq[rook][rfrom] ^ Zobrist::psq[rook][rto];
         dp.count = 2;
         dp.piece[1] = rook;
@@ -251,12 +344,16 @@ void Position::do_move(Move m) {
             dp.piece[1] = captured;
             dp.from[1] = capsq;
             dp.to[1] = SQ_NONE;
-            remove_piece(capsq);
+            remove_piece(capsq, td);
             k ^= Zobrist::psq[captured][capsq];
             if (type_of(captured) == PAWN) st.pawnKey ^= Zobrist::psq[captured][capsq];
             st.rule50 = 0;
         }
-        move_piece(from, to);
+        if (m.type_of() == PROMOTION) {
+            remove_piece(from, td);
+            put_piece(make_piece(us, m.promotion_type()), to, td);
+        } else
+            move_piece(from, to, td);
         k ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];
 
         if (type_of(pc) == PAWN) {
@@ -264,8 +361,6 @@ void Position::do_move(Move m) {
             st.pawnKey ^= Zobrist::psq[pc][from];
             if (m.type_of() == PROMOTION) {
                 Piece promo = make_piece(us, m.promotion_type());
-                remove_piece(to);
-                put_piece(promo, to);
                 k ^= Zobrist::psq[pc][to] ^ Zobrist::psq[promo][to];
                 dp.to[0] = SQ_NONE;  // piyon kalktı, terfi taşı geldi
                 dp.piece[dp.count] = promo;
@@ -291,6 +386,11 @@ void Position::do_move(Move m) {
         k ^= Zobrist::castling[st.castlingRights];
         st.castlingRights &= ~(castlingRightsMask[from] | castlingRightsMask[to]);
         k ^= Zobrist::castling[st.castlingRights];
+    }
+
+    for (Color c : {WHITE, BLACK}) {
+        td.pawns[c] = pieces(c, PAWN);
+        td.ksq[c] = king_square(c);
     }
 
     st.key = k;
@@ -340,6 +440,12 @@ void Position::do_null_move() {
     st.captured = NO_PIECE;
     st.checkers = 0;
     st.dirty.count = 0;
+    ThreatDelta& td = new_delta();
+    const ThreatDelta& prev = deltas[states.size() - 1];
+    for (Color c : {WHITE, BLACK}) {
+        td.pawns[c] = prev.pawns[c];
+        td.ksq[c] = prev.ksq[c];
+    }
     sideToMove = ~sideToMove;
     ++gamePly;
     set_check_info(st);

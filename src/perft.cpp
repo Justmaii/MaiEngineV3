@@ -4,7 +4,9 @@
 
 #include <fstream>
 #include <iomanip>
+#include <algorithm>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <vector>
 
@@ -85,12 +87,28 @@ uint64_t verify(Position& pos, int depth, uint64_t& nodes) {
         if (pos.legal_move(junk) && !all.contains(junk)) report("legal_move çöp hamleyi kabul etti: " + move_to_uci(junk));
     }
 
+    // Tehdit farkı: önceki tehditler + hamlenin yazdığı değişiklikler = sonraki tehditler
+    uint32_t t0[512], t1[512];
+    const int n0 = pos.all_threats(t0, 512);
+    std::sort(t0, t0 + n0);
     for (const auto& em : all) {
         bool predicted = pos.gives_check(em.move);
         pos.do_move(em.move);
         bool actual = pos.checkers() != 0;
+
+        const ThreatDelta& d = pos.threat_delta(pos.state_index());
+        std::map<uint32_t, int> count;
+        for (int i = 0; i < n0; ++i) ++count[t0[i]];
+        for (int i = 0; i < d.count; ++i) count[d.raw[i] & ~ThreatAdded] += (d.raw[i] & ThreatAdded) ? 1 : -1;
+        const int n1 = pos.all_threats(t1, 512);
+        bool ok = !d.overflow;
+        for (int i = 0; i < n1; ++i) ok &= count[t1[i]]-- == 1;
+        for (const auto& [raw, c] : count) ok &= c == 0;
+        for (Color c : {WHITE, BLACK})
+            ok &= d.pawns[c] == pos.pieces(c, PAWN) && d.ksq[c] == pos.king_square(c);
         pos.undo_move(em.move);
         if (predicted != actual) report("gives_check yanlış: " + move_to_uci(em.move));
+        if (!ok) report("tehdit farkı tutmuyor: " + move_to_uci(em.move));
     }
 
     if (depth <= 0) return errors;

@@ -600,6 +600,7 @@ void Thread::update_correction_history(const Position& pos, Search::Stack* ss, i
 }
 
 void Thread::do_move(Position& pos, Move m, Search::Stack* ss) {
+    TT.prefetch(pos.prefetch_key(m));
     const bool capture = pos.capture_stage(m);
     const Piece pc = pos.moved_piece(m);
     nodes.store(nodes.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
@@ -610,6 +611,8 @@ void Thread::do_move(Position& pos, Move m, Search::Stack* ss) {
 }
 
 void Thread::do_null_move(Position& pos, Search::Stack* ss) {
+    TT.prefetch(pos.key() ^ Zobrist::side
+                ^ (pos.ep_square() != SQ_NONE ? Zobrist::enpassant[file_of(pos.ep_square())] : 0));
     pos.do_null_move();
     ss->currentMove = Move::null();
     ss->continuationHistory = &continuationHistory[0][0](NO_PIECE, SQ_A1);

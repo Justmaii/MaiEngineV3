@@ -105,6 +105,15 @@ public:
     // Tahtadaki tüm tehditler (ham kodlama, sırasız); en fazla max tane yazar, sayıyı döner
     int all_threats(uint32_t* out, int max) const;
     Key key() const { return state().key; }
+    // Hamleden sonraki anahtarın tahmini (TT kaydını önceden çekmek için; rok, terfi ve
+    // rok hakları hesaba katılmaz, o nadir hamlelerde boşa bir önbellek isteği gider)
+    Key prefetch_key(Move m) const {
+        const Square from = m.from_sq(), to = m.to_sq();
+        const Piece pc = board[from];
+        Key k = key() ^ Zobrist::side ^ Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to] ^ Zobrist::psq[board[to]][to];
+        if (ep_square() != SQ_NONE) k ^= Zobrist::enpassant[file_of(ep_square())];
+        return k;
+    }
     Key pawn_key() const { return state().pawnKey; }
     Key minor_piece_key() const { return state().minorPieceKey; }
     Key non_pawn_key(Color c) const { return state().nonPawnKey[c]; }
@@ -172,7 +181,7 @@ private:
     void remove_piece(Square s, ThreatDelta& d);
     void move_piece(Square from, Square to, ThreatDelta& d);
     void threats_of(Piece pc, Square s, uint32_t added, ThreatDelta& d) const;
-    void rays_through(Square s, uint32_t added, ThreatDelta& d) const;
+    void rays_through(Square s, uint32_t added, ThreatDelta& d, Square other = SQ_NONE) const;
     ThreatDelta& new_delta();
     void set_check_info(StateInfo& st) const;
     void update_slider_blockers(StateInfo& st, Color c) const;

@@ -211,11 +211,14 @@ makinesinde SF19 3000'e karşı 16/20, 3190'a karşı 12,5/20 bildirmişti.
 aynı bulut makinesi: MaiEngine v3 768k · inphish 4.0 711k · Stockfish 19 557k · inphish 5.0 383k
 düğüm/sn. (SF19 ve inphish 5 daha büyük bir ağ kullanıyor, düğüm başına daha pahalı.)
 
-`bench 13` (22 pozisyon, sabit derinlik; imza **606127** düğüm), MacBook Air, macOS: **~1,4M nps**.
+`bench 13` (22 pozisyon, sabit derinlik; imza **606127** düğüm), MacBook Air, macOS: **~1,48M nps**.
 SF19 ağına geçiş düğüm başına maliyeti artırmıştı (SF15.1 ağıyla ~2,0M); birleşik
-accumulator, hybrid şah güncellemesi ve NEON'lu seyrek girdi tespiti farkı kapattı:
-aynı pozisyonlarda (`go nodes 4000000`) Stockfish 19'un ~0,8'i (başlangıç 1,11M'e karşı
-1,38M, orta oyun 1,03M'e karşı 1,31M); önceki sürüm ~0,6'sıydı.
+accumulator, hybrid şah güncellemesi, NEON'lu seyrek girdi tespiti, hamleden önce TT
+kaydını önbelleğe isteme ve alışlarda / ışın boyunca hareketlerde gereksiz tehdit
+satırlarını yazmama (Stockfish'teki `swap_piece` / `noRaysContaining`) farkı kapattı:
+aynı pozisyonlarda (`go nodes 4000000`) Stockfish 19'un ~0,85-0,95'i (başlangıç 1,21M'e
+karşı 1,41M, orta oyun 1,09M'e karşı 1,31M, oyun sonu 2,30M'e karşı 2,43M); önceki sürüm
+~0,6'sıydı.
 
 (v2, C#: 200-370k nps.)
 

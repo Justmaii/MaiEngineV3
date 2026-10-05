@@ -157,12 +157,18 @@ void Position::threats_of(Piece pc, Square s, uint32_t added, ThreatDelta& d) co
     }
 }
 
-void Position::rays_through(Square s, uint32_t added, ThreatDelta& d) const {
+// other: aynı hamlede taşın gittiği / geldiği kare. Kaydıran x'ten bakınca ikisi aynı
+// yöndeyse (taş ışın boyunca gidiyor) açılan ve kapanan tehdit aynıdır: hiç yazılmaz
+// (Stockfish'teki noRaysContaining).
+void Position::rays_through(Square s, uint32_t added, ThreatDelta& d, Square other) const {
     const Bitboard occ = pieces(), targets = occ & ~pieces(KING);
     const Bitboard rookRay = attacks_bb<ROOK>(s, occ), bishopRay = attacks_bb<BISHOP>(s, occ);
     auto beyond = [&](Bitboard sliders, Bitboard ray) {
         for (Bitboard b = sliders & ray; b;) {
             const Square x = pop_lsb(b);
+            if (other != SQ_NONE && (line_bb(x, s) & square_bb(other))
+                && ((between_bb(x, other) & square_bb(s)) || (between_bb(x, s) & square_bb(other))))
+                continue;
             // s'den, x'in tersi yönde ilk taş
             const Bitboard y = ray & line_bb(x, s) & ~between_bb(x, s) & ~square_bb(x) & targets;
             if (y) push_threat(d, pack_threat(board[x], x, lsb(y), board[lsb(y)]) | added);
@@ -186,8 +192,12 @@ void Position::remove_piece(Square s, ThreatDelta& d) {
 
 void Position::move_piece(Square from, Square to, ThreatDelta& d) {
     const Piece pc = board[from];
-    remove_piece(from, d);
-    put_piece(pc, to, d);
+    threats_of(pc, from, 0, d);
+    remove_piece(from);
+    rays_through(from, ThreatAdded, d, to);
+    rays_through(to, 0, d, from);
+    put_piece(pc, to);
+    threats_of(pc, to, ThreatAdded, d);
 }
 
 int Position::all_threats(uint32_t* out, int max) const {
@@ -386,13 +396,14 @@ void Position::do_move(Move m) {
         dp.from[1] = rfrom;
         dp.to[1] = rto;
     } else {
+        const bool swapCapture = captured && m.type_of() != EN_PASSANT;
         if (captured) {
             Square capsq = m.type_of() == EN_PASSANT ? to - pawn_push(us) : to;
             dp.count = 2;
             dp.piece[1] = captured;
             dp.from[1] = capsq;
             dp.to[1] = SQ_NONE;
-            remove_piece(capsq, td);
+            if (!swapCapture) remove_piece(capsq, td);
             k ^= Zobrist::psq[captured][capsq];
             if (type_of(captured) == PAWN) st.pawnKey ^= Zobrist::psq[captured][capsq];
             else {
@@ -401,9 +412,18 @@ void Position::do_move(Move m) {
             }
             st.rule50 = 0;
         }
-        if (m.type_of() == PROMOTION) {
+        const Piece arriving = m.type_of() == PROMOTION ? make_piece(us, m.promotion_type()) : pc;
+        if (swapCapture) {
+            // Alış: hedef kare dolu kalıyor, içinden geçen ışınlar değişmez (Stockfish'teki
+            // swap_piece). Önce taş kaynaktan kalkar, sonra hedefte alınan taşın yerini alır.
             remove_piece(from, td);
-            put_piece(make_piece(us, m.promotion_type()), to, td);
+            threats_of(captured, to, 0, td);
+            remove_piece(to);
+            put_piece(arriving, to);
+            threats_of(arriving, to, ThreatAdded, td);
+        } else if (m.type_of() == PROMOTION) {
+            remove_piece(from, td);
+            put_piece(arriving, to, td);
         } else
             move_piece(from, to, td);
         k ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];

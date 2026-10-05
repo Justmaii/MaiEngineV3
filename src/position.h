@@ -52,10 +52,13 @@ struct ThreatDelta {
 struct StateInfo {
     DirtyPiece dirty;
     Key key;
-    Key pawnKey;
+    Key pawnKey;           // piyonlar (correction ve pawn history)
+    Key minorPieceKey;     // atlar ve filler
+    Key nonPawnKey[COLOR_NB];  // piyon olmayan taşlar (şah dahil), renk başına
     int castlingRights;
     int rule50;
     int pliesFromNull;
+    int repetition;  // aynı pozisyonun önceki geçişine uzaklık (3 kez ise negatif), yoksa 0
     Square epSquare;
     Piece captured;
     Bitboard checkers;  // hamle sırası kimdeyse onun şahına şah çeken taşlar
@@ -65,16 +68,11 @@ struct StateInfo {
     Bitboard checkSquares[PIECE_TYPE_NB];  // sırası gelen taraf bu tipte taşı buraya koyarsa şah çeker
 };
 
-// Taş değerleri (Stockfish 15.1 ölçeği: piyon oyunsonu değeri 208 = 1 piyon)
-constexpr int PawnValueMg = 126, PawnValueEg = 208;
-constexpr int KnightValueMg = 781, KnightValueEg = 854;
-constexpr int BishopValueMg = 825, BishopValueEg = 915;
-constexpr int RookValueMg = 1276, RookValueEg = 1380;
-constexpr int QueenValueMg = 2538, QueenValueEg = 2682;
-constexpr int PieceValueMg[PIECE_NB] = {0, PawnValueMg, KnightValueMg, BishopValueMg, RookValueMg, QueenValueMg, 0, 0,
-                                        0, PawnValueMg, KnightValueMg, BishopValueMg, RookValueMg, QueenValueMg, 0, 0};
-constexpr int PieceValueEg[PIECE_NB] = {0, PawnValueEg, KnightValueEg, BishopValueEg, RookValueEg, QueenValueEg, 0, 0,
-                                        0, PawnValueEg, KnightValueEg, BishopValueEg, RookValueEg, QueenValueEg, 0, 0};
+// Taş değerleri (Stockfish 19 ölçeği: 208 = 1 piyon). SEE, budama eşikleri ve
+// taş materyali (non_pawn_material) bunları kullanır.
+constexpr Value PawnValue = 208, KnightValue = 781, BishopValue = 825, RookValue = 1276, QueenValue = 2538;
+constexpr Value PieceValue[PIECE_NB] = {0, PawnValue, KnightValue, BishopValue, RookValue, QueenValue, 0, 0,
+                                        0, PawnValue, KnightValue, BishopValue, RookValue, QueenValue, 0, 0};
 
 class Position {
 public:
@@ -108,6 +106,8 @@ public:
     int all_threats(uint32_t* out, int max) const;
     Key key() const { return state().key; }
     Key pawn_key() const { return state().pawnKey; }
+    Key minor_piece_key() const { return state().minorPieceKey; }
+    Key non_pawn_key(Color c) const { return state().nonPawnKey[c]; }
     Bitboard checkers() const { return state().checkers; }
     int castling_rights() const { return state().castlingRights; }
     Square ep_square() const { return state().epSquare; }
@@ -130,9 +130,12 @@ public:
     Bitboard pinners(Color c) const { return state().pinners[c]; }
     Bitboard check_squares(PieceType pt) const { return state().checkSquares[pt]; }
     int non_pawn_material(Color c) const {
-        return KnightValueMg * popcount(pieces(c, KNIGHT)) + BishopValueMg * popcount(pieces(c, BISHOP))
-             + RookValueMg * popcount(pieces(c, ROOK)) + QueenValueMg * popcount(pieces(c, QUEEN));
+        return KnightValue * popcount(pieces(c, KNIGHT)) + BishopValue * popcount(pieces(c, BISHOP))
+             + RookValue * popcount(pieces(c, ROOK)) + QueenValue * popcount(pieces(c, QUEEN));
     }
+    // c renginin pt tipindeki taşlarının saldırdığı kareler
+    template <PieceType Pt>
+    Bitboard attacks_by(Color c) const;
     int non_pawn_material() const { return non_pawn_material(WHITE) + non_pawn_material(BLACK); }
 
     bool gives_check(Move m) const;
@@ -150,11 +153,15 @@ public:
 
     // Tekrar / 50 hamle beraberliği (ply: aramadaki derinlik, kökten itibaren)
     bool is_draw(int ply) const;
+    // Tek hamlede tekrara gidilebiliyor mu? (cuckoo tabloları, Stockfish'teki gibi)
+    bool upcoming_repetition(int ply) const;
+    static void init_cuckoo();
 
     // Hata ayıklama: anahtarları ve bitboard'ları sıfırdan hesaplayıp karşılaştırır
     bool pos_is_ok(std::string* why = nullptr) const;
     Key compute_key() const;
     Key compute_pawn_key() const;
+    void compute_piece_keys(StateInfo& st) const;
 
 private:
     void put_piece(Piece pc, Square s);

@@ -31,18 +31,20 @@ struct LimitsType {
 struct Stack {
     Move* pv;
     PieceToHistory* continuationHistory;
+    PieceToCorrection* continuationCorrectionHistory;
     int ply;
     Move currentMove;
     Move excludedMove;
-    Move killers[2];
     Value staticEval;
     int statScore;
     int moveCount;
     bool inCheck;
     bool ttPv;
     bool ttHit;
-    int doubleExtensions;
+    bool followPV;  // önceki iterasyonun PV'si üzerinde mi
     int cutoffCnt;
+    int reduction;
+    int priorNMPFailHigh;  // bu ply'da kaç null move beta'yı geçti
 };
 
 struct RootMove {
@@ -52,13 +54,19 @@ struct RootMove {
     bool operator<(const RootMove& m) const {
         return m.score != score ? m.score < score : m.previousScore < previousScore;
     }
+    bool is_inexact() const { return inexactLower || inexactUpper; }
+    bool is_exact_loss() const { return score != -VALUE_INFINITE && is_loss(score) && !is_inexact(); }
+    void unset_inexact() { inexactLower = inexactUpper = false; }
+
+    uint64_t effort = 0;  // bu hamlenin altında aranan düğüm
     Value score = -VALUE_INFINITE;
     Value previousScore = -VALUE_INFINITE;
     Value averageScore = -VALUE_INFINITE;
+    Value meanSquaredScore = -VALUE_INFINITE * VALUE_INFINITE;
     Value uciScore = -VALUE_INFINITE;
-    bool scoreLowerbound = false, scoreUpperbound = false;
+    bool inexactLower = false, inexactUpper = false;  // skor sadece alt / üst sınır
     int selDepth = 0;
-    std::vector<Move> pv;
+    std::vector<Move> pv, previousPV;
 };
 
 struct Options {
@@ -66,7 +74,7 @@ struct Options {
 };
 extern Options options;
 
-void init();   // LMR tablosu (iş parçacığı sayısına bağlı)
+void init();   // iş parçacığı sayısı değişince
 void clear();  // yeni oyun: TT + history'ler
 
 }  // namespace Search
@@ -79,6 +87,7 @@ public:
     TimePoint maximum() const { return maximumTime; }
     TimePoint hard() const { return hardTime; }
     TimePoint elapsed() const { return now() - startTime; }
+    double originalTimeAdjust = -1;  // oyun başında bir kez hesaplanır (yeni oyunda -1)
 
 private:
     TimePoint startTime = 0, optimumTime = 0, maximumTime = 0, hardTime = 0;
@@ -104,13 +113,19 @@ public:
     std::atomic<uint64_t> nodes{0};
     std::atomic<int> bestMoveChanges{0};
     Value rootDelta = 1;
+    int optimism[COLOR_NB] = {};  // SF19: kök skoruna göre iyimserlik (değerlendirmeye girer)
     int nmpMinPly = 0;
-    Color nmpColor = WHITE;
+    std::vector<Move> lastIterationIdxPV;  // önceki iterasyonun PV'si (followPV için)
+    int reductions[MAX_MOVES];
 
     ButterflyHistory mainHistory;
+    LowPlyHistory lowPlyHistory;
     CaptureHistory captureHistory;
     ContinuationHistory continuationHistory[2][2];  // [şahta mı][alış mı]
-    CounterMoveHistory counterMoves;
+    PawnHistory pawnHistory;
+    CorrectionHistory correctionHistory;
+    ContinuationCorrectionHistory continuationCorrectionHistory;
+    TTMoveHistory ttMoveHistory;
 
     // Sadece ana iş parçacığı (zaman yönetimi)
     Value bestPreviousScore = VALUE_INFINITE, bestPreviousAverageScore = VALUE_INFINITE;
@@ -129,10 +144,17 @@ private:
     template <int NT>
     Value qsearch(Position& pos, Search::Stack* ss, Value alpha, Value beta);
 
-    void update_all_stats(const Position& pos, Search::Stack* ss, Move bestMove, Value bestValue, Value beta,
-                          Square prevSq, Move* quietsSearched, int quietCount, Move* capturesSearched,
-                          int captureCount, Depth depth);
-    void update_quiet_stats(const Position& pos, Search::Stack* ss, Move move, int bonus);
+    Value evaluate(const Position& pos);
+    int reduction(bool improving, Depth d, int mn, int delta) const;
+    int correction_value(const Position& pos, const Search::Stack* ss);
+    void update_correction_history(const Position& pos, Search::Stack* ss, int bonus);
+    void do_move(Position& pos, Move m, Search::Stack* ss);
+    void undo_move(Position& pos, Move m) { pos.undo_move(m); }
+    void do_null_move(Position& pos, Search::Stack* ss);
+    void update_all_stats(const Position& pos, Search::Stack* ss, Move bestMove, Square prevSq,
+                          const Move* quietsSearched, int quietCount, const Move* capturesSearched,
+                          int captureCount, Depth depth, Move ttMove, bool PvNode);
+    void update_quiet_histories(const Position& pos, Search::Stack* ss, Move move, int bonus);
 
     std::mutex mutex;
     std::condition_variable cv;

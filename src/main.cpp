@@ -93,7 +93,7 @@ int brute_see_rest(Position& pos, Square to) {
     for (const auto& em : MoveList<CAPTURES>(pos)) {
         Move m = em.move;
         if (m.to_sq() != to || m.type_of() != NORMAL) continue;
-        int gain = PieceValueMg[pos.piece_on(to)];
+        int gain = PieceValue[pos.piece_on(to)];
         pos.do_move(m);
         gain -= brute_see_rest(pos, to);
         pos.undo_move(m);
@@ -115,6 +115,7 @@ std::string join_fen(const std::vector<std::string>& args, size_t from) {
 int main(int argc, char** argv) {
     Bitboards::init();
     Zobrist::init();
+    Position::init_cuckoo();
     {
         std::string self = argv[0];
         size_t slash = self.find_last_of('/');
@@ -231,7 +232,7 @@ int main(int argc, char** argv) {
                 // Terfi karesine alışlar SEE'nin kapsamı dışında (ikisi farklı sayar), atla
                 if (rank_of(m.to_sq()) == RANK_1 || rank_of(m.to_sq()) == RANK_8) continue;
                 ++caps;
-                int val = PieceValueMg[pos.piece_on(m.to_sq())];
+                int val = PieceValue[pos.piece_on(m.to_sq())];
                 pos.do_move(m);
                 val -= brute_see_rest(pos, m.to_sq());
                 pos.undo_move(m);

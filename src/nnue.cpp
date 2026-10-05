@@ -3,6 +3,7 @@
 #include "nnue.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -39,6 +40,7 @@ struct Network {
     alignas(64) int32_t psqPsqt[PsqDims * PsqtBuckets];
     alignas(64) int32_t otherPsqt[OtherDims * PsqtBuckets];
     LayerStack stacks[LayerStacks];
+    bool hasPsqt;  // SF19 ağında var; SFNNv17 ağında (nn-252f33942263) psqt çıkışı yok
 };
 
 std::unique_ptr<Network> net;
@@ -151,7 +153,7 @@ inline uint32_t pair_index(Color persp, int orient, Color ca, Square a, Color cb
 // "Diğer" bloğun (tehdit + piyon çifti) indeks listesi. Eklenen satırın ağırlıkları
 // önceden önbelleğe istenir: 66 MB'lık tabloda rastgele erişim, asıl maliyet bekleme.
 struct IndexList {
-    uint32_t v[MaxSpan * MaxThreatChanges + 512];
+    uint32_t v[2 * MaxThreats + 1024];  // tüm etkin tehditler + piyon çiftleri sığar
     int n = 0;
     void push(uint32_t i) {
         __builtin_prefetch(net->otherWeight + size_t(i) * HalfDims);
@@ -196,44 +198,21 @@ void pair_changes(Color persp, int orient, Bitboard updW, Bitboard updB, Bitboar
     }
 }
 
-// (from, to] hamlelerinin tehdit değişikliklerini topla, birbirini götürenleri at,
-// bu bakışın indekslerine çevir. Piyon çiftleri iki uçtaki piyonların farkından.
-// Bir hamlenin listesi taşmışsa false (çağıran baştan hesaplar).
-bool other_changes(const Position& pos, int from, int to, Color persp, Square ksq, IndexList& added,
-                   IndexList& removed) {
-    uint32_t buf[MaxSpan * MaxThreatChanges];
-    int n = 0;
-    for (int k = from + 1; k <= to; ++k) {
-        const ThreatDelta& d = pos.threat_delta(k);
-        if (d.overflow) return false;
-        std::memcpy(buf + n, d.raw, sizeof(uint32_t) * d.count);
-        n += d.count;
-    }
-    // Aynı tehdidin eklenip kalkması birbirini götürür (ör. alışta açılıp kapanan ışın)
-    auto key = [](uint32_t r) { return r & ~ThreatAdded; };
-    if (n <= 32)
-        for (int i = 1; i < n; ++i) {  // küçük listede eklemeli sıralama
-            const uint32_t v = buf[i];
-            int k = i - 1;
-            for (; k >= 0 && key(buf[k]) > key(v); --k) buf[k + 1] = buf[k];
-            buf[k + 1] = v;
-        }
-    else
-        std::sort(buf, buf + n, [&](uint32_t a, uint32_t b) { return key(a) < key(b); });
-
+// k'ya giden hamlenin tehdit değişikliklerini bu bakışın indekslerine çevir; piyon
+// çiftleri iki durumun piyonlarının farkından. Aynı hamlede kalkıp yeniden eklenen
+// nadir tehditler ayıklanmaz (iki satır fazla, sıralamaktan ucuz). Hamlenin listesi
+// taşmışsa false (çağıran baştan hesaplar).
+bool other_changes(const Position& pos, int k, Color persp, Square ksq, IndexList& added, IndexList& removed) {
     const int orient = other_orient(persp, ksq), swap = 8 * persp;
-    for (int i = 0; i < n;) {
-        int balance = 0, k = i;
-        for (; k < n && key(buf[k]) == key(buf[i]); ++k) balance += (buf[k] & ThreatAdded) ? 1 : -1;
-        if (balance) {
-            const uint32_t idx = threat_index(buf[i], orient, swap);
-            if (idx < uint32_t(ThreatDims)) (balance > 0 ? added : removed).push(idx);
-        }
-        i = k;
+    const ThreatDelta& d = pos.threat_delta(k);
+    if (d.overflow) return false;
+    for (int i = 0; i < d.count; ++i) {
+        const uint32_t idx = threat_index(d.raw[i], orient, swap);
+        if (idx < uint32_t(ThreatDims)) ((d.raw[i] & ThreatAdded) ? added : removed).push(idx);
     }
 
-    const ThreatDelta &a = pos.threat_delta(from), &b = pos.threat_delta(to);
-    const Bitboard bw = a.pawns[WHITE], bb = a.pawns[BLACK], aw = b.pawns[WHITE], ab = b.pawns[BLACK];
+    const ThreatDelta& a = pos.threat_delta(k - 1);
+    const Bitboard bw = a.pawns[WHITE], bb = a.pawns[BLACK], aw = d.pawns[WHITE], ab = d.pawns[BLACK];
     if (bw != aw || bb != ab) {
         pair_changes(persp, orient, aw & ~bw, ab & ~bb, aw, ab, added);
         pair_changes(persp, orient, bw & ~aw, bb & ~ab, bw, bb, removed);
@@ -275,12 +254,22 @@ void apply_other(int16_t* acc, int32_t* psqt, const IndexList& added, const Inde
     }
 }
 
-// Bir güncellemede eklenip çıkarılacak satırlar: HalfKA (int16) ve tehdit/piyon çifti (int8)
+// Bir güncellemede eklenip çıkarılacak satırlar: int16 satırlar (HalfKA ağırlıkları ya da
+// bütün bir accumulator / Finny kaydı) ve int8 satırlar (tehdit / piyon çifti).
+// Her int16 satırın psqt karşılığı da yanında.
 struct RowDelta {
-    const int16_t* add16[64];
-    const int16_t* sub16[64];
+    static constexpr int Max16 = 72;
+    const int16_t* add16[Max16];
+    const int16_t* sub16[Max16];
+    const int32_t* addP[Max16];
+    const int32_t* subP[Max16];
     int nAdd16 = 0, nSub16 = 0;
     IndexList add8, sub8;
+
+    void add_raw(const int16_t* r, const int32_t* p) { add16[nAdd16] = r, addP[nAdd16++] = p; }
+    void sub_raw(const int16_t* r, const int32_t* p) { sub16[nSub16] = r, subP[nSub16++] = p; }
+    void add_psq(int i) { add_raw(net->psqWeight + size_t(i) * HalfDims, net->psqPsqt + size_t(i) * PsqtBuckets); }
+    void sub_psq(int i) { sub_raw(net->psqWeight + size_t(i) * HalfDims, net->psqPsqt + size_t(i) * PsqtBuckets); }
 };
 
 // out = in + tüm satır farkları, tek geçişte. Toplamın 128'lik dilimi yazmaçlarda
@@ -346,13 +335,15 @@ void apply_delta(int16_t* out, const int16_t* in, const RowDelta& d) {  // out =
 #endif
 }
 
-void apply_delta_psqt(int32_t* out, const int32_t* in, const RowDelta& d, const int32_t* const* addP,
-                      const int32_t* const* subP) {
-    std::memcpy(out, in, sizeof(int32_t) * PsqtBuckets);
-    for (int i = 0; i < d.nAdd16; ++i) add_psqt(out, addP[i]);
-    for (int i = 0; i < d.nSub16; ++i) sub_psqt(out, subP[i]);
-    for (int i = 0; i < d.add8.n; ++i) add_psqt(out, net->otherPsqt + size_t(d.add8.v[i]) * PsqtBuckets);
-    for (int i = 0; i < d.sub8.n; ++i) sub_psqt(out, net->otherPsqt + size_t(d.sub8.v[i]) * PsqtBuckets);
+void apply_delta_psqt(int32_t* out, const int32_t* in, const RowDelta& d) {  // out == in olabilir
+    if (!net->hasPsqt) return;  // hep sıfır kalır
+    int32_t p[PsqtBuckets];
+    std::memcpy(p, in, sizeof(p));
+    for (int i = 0; i < d.nAdd16; ++i) add_psqt(p, d.addP[i]);
+    for (int i = 0; i < d.nSub16; ++i) sub_psqt(p, d.subP[i]);
+    for (int i = 0; i < d.add8.n; ++i) add_psqt(p, net->otherPsqt + size_t(d.add8.v[i]) * PsqtBuckets);
+    for (int i = 0; i < d.sub8.n; ++i) sub_psqt(p, net->otherPsqt + size_t(d.sub8.v[i]) * PsqtBuckets);
+    std::memcpy(out, p, sizeof(p));
 }
 
 // uint8 girdi x int8 ağırlık iç çarpımı (n, 32'nin katı)
@@ -397,14 +388,11 @@ inline int32_t dot_u8i8(const uint8_t* __restrict a, const int8_t* __restrict w,
 }
 
 // İkişerli çarpım: 1024 toplam -> 512 bayt (her bakış için), [0,255]'e kırp, çarp, 512'ye böl
-// Girdi iki parçanın toplamı (int16, taşarsa Stockfish'teki gibi sarar)
-inline void transform_half(const int16_t* __restrict p, const int16_t* __restrict q, uint8_t* __restrict out) {
+inline void transform_half(const int16_t* __restrict p, uint8_t* __restrict out) {
     constexpr int H = HalfDims / 2;
 #if defined(__ARM_NEON)
     const int16x8_t zero = vdupq_n_s16(0), max = vdupq_n_s16(255);
-    auto clip = [&](int i) {
-        return vreinterpretq_u16_s16(vminq_s16(vmaxq_s16(vaddq_s16(vld1q_s16(p + i), vld1q_s16(q + i)), zero), max));
-    };
+    auto clip = [&](int i) { return vreinterpretq_u16_s16(vminq_s16(vmaxq_s16(vld1q_s16(p + i), zero), max)); };
     for (int j = 0; j < H; j += 16) {
         // 255 * 255 = 65025 uint16'ya sığar
         const uint16x8_t a0 = clip(j), a1 = clip(j + 8), b0 = clip(H + j), b1 = clip(H + j + 8);
@@ -413,8 +401,8 @@ inline void transform_half(const int16_t* __restrict p, const int16_t* __restric
     return;
 #endif
     for (int j = 0; j < H; ++j) {
-        unsigned a = unsigned(std::clamp<int>(int16_t(p[j] + q[j]), 0, 255));
-        unsigned b = unsigned(std::clamp<int>(int16_t(p[j + H] + q[j + H]), 0, 255));
+        unsigned a = unsigned(std::clamp<int>(p[j], 0, 255));
+        unsigned b = unsigned(std::clamp<int>(p[j + H], 0, 255));
         out[j] = uint8_t((a * b) / 512);
     }
 }
@@ -427,14 +415,33 @@ int propagate(const uint8_t* input, int bucket) {
 
     // Girdinin çoğu sıfır: sadece sıfır olmayan 4 baytlık parçaların ağırlık sütunlarını ekle
     alignas(64) int32_t fc0[L2];
-    uint16_t nnz[HalfDims / 4];
+    uint16_t nnz[HalfDims / 4 + 8];
     int nnzCount = 0;
     uint32_t in32[HalfDims / 4];
     std::memcpy(in32, input, HalfDims);
+#if defined(__ARM_NEON)
+    // 8'li gruplar: sıfır olmayanların bit maskesi -> hazır indeks tablosundan tek yazma
+    static const auto NnzLut = [] {
+        std::array<std::array<uint16_t, 8>, 256> t{};
+        for (int m = 0; m < 256; ++m)
+            for (int b = 0, k = 0; b < 8; ++b)
+                if (m & (1 << b)) t[m][k++] = uint16_t(b);
+        return t;
+    }();
+    const uint16x8_t bitVals = {1, 2, 4, 8, 16, 32, 64, 128};
+    for (int c = 0; c < HalfDims / 4; c += 8) {
+        const uint32x4_t a = vld1q_u32(in32 + c), b = vld1q_u32(in32 + c + 4);
+        const uint16x8_t nz = vcombine_u16(vmovn_u32(vtstq_u32(a, a)), vmovn_u32(vtstq_u32(b, b)));
+        const unsigned mask = vaddvq_u16(vandq_u16(nz, bitVals));
+        vst1q_u16(nnz + nnzCount, vaddq_u16(vld1q_u16(NnzLut[mask].data()), vdupq_n_u16(uint16_t(c))));
+        nnzCount += popcount(mask);
+    }
+#else
     for (int c = 0; c < HalfDims / 4; ++c) {  // dalsız
         nnz[nnzCount] = uint16_t(c);
         nnzCount += in32[c] != 0;
     }
+#endif
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     int32x4_t acc[L2 / 4];
     for (int k = 0; k < L2 / 4; ++k) acc[k] = vld1q_s32(ls.b0 + 4 * k);
@@ -490,13 +497,11 @@ int propagate(const uint8_t* input, int bucket) {
     return int32_t(int64_t(fwd) * (600 * OutputScale) / (128 * (1 << WeightScaleBits) * 2));
 }
 
-alignas(64) const int16_t Zero16[HalfDims] = {};
 
-Output output(const int16_t* usPsq, const int16_t* usThr, const int16_t* themPsq, const int16_t* themThr,
-              int32_t psqtUs, int32_t psqtThem, int bucket) {
+Output output(const int16_t* us, const int16_t* them, int32_t psqtUs, int32_t psqtThem, int bucket) {
     alignas(64) uint8_t input[HalfDims];
-    transform_half(usPsq, usThr, input);
-    transform_half(themPsq, themThr, input + HalfDims / 2);
+    transform_half(us, input);
+    transform_half(them, input + HalfDims / 2);
     const int psqt = (psqtUs - psqtThem) / 2;
     return {psqt / OutputScale, propagate(input, bucket) / OutputScale};
 }
@@ -544,6 +549,7 @@ bool read_leb128(std::istream& in, T* dst, size_t n) {
 }  // namespace
 
 bool loaded() { return net != nullptr; }
+bool has_psqt() { return net->hasPsqt; }
 const std::string& description() { return netDescription; }
 
 bool load(const std::string& path, std::string* err) {
@@ -566,13 +572,30 @@ bool load(const std::string& path, std::string* err) {
     int8_t* pairW = n->otherWeight + size_t(ThreatDims) * HalfDims;
     int32_t* threatP = n->otherPsqt;
     int32_t* pairP = n->otherPsqt + size_t(ThreatDims) * PsqtBuckets;
-    if (!read_leb128(in, n->ftBias, HalfDims) || !read_array(in, threatW, size_t(ThreatDims) * HalfDims)
-        || !read_leb128(in, threatP, size_t(ThreatDims) * PsqtBuckets)
-        || !read_array(in, pairW, size_t(PairDims) * HalfDims)
-        || !read_leb128(in, pairP, size_t(PairDims) * PsqtBuckets)
-        || !read_leb128(in, n->psqWeight, size_t(PsqDims) * HalfDims)
-        || !read_leb128(in, n->psqPsqt, size_t(PsqDims) * PsqtBuckets))
+    if (!read_leb128(in, n->ftBias, HalfDims) || !read_array(in, threatW, size_t(ThreatDims) * HalfDims))
         return fail("ağ dosyası eksik ya da bozuk (ilk katman)");
+
+    // Tehdit ağırlıklarından sonra sıkıştırılmış blok geliyorsa psqt'li (SF19) ağ, ham
+    // piyon çifti ağırlıkları geliyorsa psqt'siz (SFNNv17) ağ
+    char next[17];
+    const auto mark = in.tellg();
+    in.read(next, sizeof(next));
+    n->hasPsqt = in && std::memcmp(next, "COMPRESSED_LEB128", sizeof(next)) == 0;
+    in.seekg(mark);
+    bool ok;
+    if (n->hasPsqt)
+        ok = read_leb128(in, threatP, size_t(ThreatDims) * PsqtBuckets)
+          && read_array(in, pairW, size_t(PairDims) * HalfDims)
+          && read_leb128(in, pairP, size_t(PairDims) * PsqtBuckets)
+          && read_leb128(in, n->psqWeight, size_t(PsqDims) * HalfDims)
+          && read_leb128(in, n->psqPsqt, size_t(PsqDims) * PsqtBuckets);
+    else {
+        ok = read_array(in, pairW, size_t(PairDims) * HalfDims)
+          && read_leb128(in, n->psqWeight, size_t(PsqDims) * HalfDims);
+        std::memset(n->psqPsqt, 0, sizeof(n->psqPsqt));
+        std::memset(n->otherPsqt, 0, sizeof(n->otherPsqt));
+    }
+    if (!ok) return fail("ağ dosyası eksik ya da bozuk (ilk katman)");
 
     for (auto& ls : n->stacks) {
         read_u32(in);  // yığın karması
@@ -614,7 +637,7 @@ Output evaluate_scratch(const Position& pos) {
     }
     const Color us = pos.side_to_move();
     const int bucket = (popcount(pos.pieces()) - 1) / 4;
-    return output(acc[us], Zero16, acc[~us], Zero16, psqt[us][bucket], psqt[~us][bucket], bucket);
+    return output(acc[us], acc[~us], psqt[us][bucket], psqt[~us][bucket], bucket);
 }
 
 // ---------------- Artımlı değerlendirici ----------------
@@ -627,131 +650,172 @@ void Evaluator::clear() {
         for (auto& e : finny) std::memcpy(e.acc, net->ftBias, sizeof(e.acc));  // boş tahta = sadece bias
 }
 
-// Finny tablosundan HalfKA kısmı: kayıtlı dizilimle şimdiki arasındaki farkı uygula
-void Evaluator::refresh_psq(const Position& pos, int idx, Color persp) {
-    ++refreshes;
-    const Square ksq = pos.king_square(persp);
-    FinnyEntry& e = finny[int(persp) * SQUARE_NB + int(ksq)];
-    FeatureCtx ctx(persp, ksq);
+namespace {
 
-    // En fazla 32 taş çıkar + 32 taş girer, 64'lük diziler yeter
-    RowDelta d;
-    const int32_t* addP[64];
-    const int32_t* subP[64];
+// Finny kaydının dizilimiyle verilen dizilim arasındaki HalfKA farkı. invert: işaretleri
+// ters çevir (kayıttan o dizilime değil, o dizilimden kayda gitmek için).
+void finny_diff(const FinnyEntry& e, const Bitboard* byColor, const Bitboard* byType, const FeatureCtx& ctx,
+                RowDelta& d, bool invert) {
     for (Color c : {WHITE, BLACK})
         for (PieceType pt = PAWN; pt <= KING; pt = PieceType(pt + 1)) {
-            const Bitboard oldBB = e.byColor[c] & e.byType[pt];
-            const Bitboard newBB = pos.pieces(c, pt);
+            const Bitboard oldBB = e.byColor[c] & e.byType[pt], newBB = byColor[c] & byType[pt];
             const Piece pc = make_piece(c, pt);
             for (Bitboard b = oldBB & ~newBB; b;) {
                 const int i = ctx.index(pop_lsb(b), pc);
-                subP[d.nSub16] = net->psqPsqt + size_t(i) * PsqtBuckets;
-                d.sub16[d.nSub16++] = net->psqWeight + size_t(i) * HalfDims;
+                invert ? d.add_psq(i) : d.sub_psq(i);
             }
             for (Bitboard b = newBB & ~oldBB; b;) {
                 const int i = ctx.index(pop_lsb(b), pc);
-                addP[d.nAdd16] = net->psqPsqt + size_t(i) * PsqtBuckets;
-                d.add16[d.nAdd16++] = net->psqWeight + size_t(i) * HalfDims;
+                invert ? d.sub_psq(i) : d.add_psq(i);
             }
         }
-    apply_delta(e.acc, e.acc, d);
-    apply_delta_psqt(e.psqt, e.psqt, d, addP, subP);
-    for (Color c : {WHITE, BLACK}) e.byColor[c] = pos.pieces(c);
-    for (PieceType pt = PAWN; pt <= KING; pt = PieceType(pt + 1)) e.byType[pt] = pos.pieces(pt);
-
-    Accumulator& acc = stack[idx];
-    std::memcpy(acc.psq[persp], e.acc, sizeof(e.acc));
-    std::memcpy(acc.psqtPsq[persp], e.psqt, sizeof(e.psqt));
 }
 
-// Tehdit + piyon çifti kısmını şimdiki tahtadan sıfırdan topla
-void Evaluator::refresh_threats(const Position& pos, int idx, Color persp) {
+// Finny kaydını verilen dizilime getir
+void finny_update(FinnyEntry& e, const Bitboard* byColor, const Bitboard* byType, const FeatureCtx& ctx) {
     RowDelta d;
-    active_other(persp, pos.king_square(persp), pos, d.add8);
-    rows += d.add8.n;
-    Accumulator& acc = stack[idx];
-    apply_delta(acc.thr[persp], Zero16, d);
-    const int32_t zero[PsqtBuckets] = {};
-    apply_delta_psqt(acc.psqtThr[persp], zero, d, nullptr, nullptr);
+    finny_diff(e, byColor, byType, ctx, d, false);
+    apply_delta(e.acc, e.acc, d);
+    apply_delta_psqt(e.psqt, e.psqt, d);
+    for (Color c : {WHITE, BLACK}) e.byColor[c] = byColor[c];
+    for (PieceType pt = PAWN; pt <= KING; pt = PieceType(pt + 1)) e.byType[pt] = byType[pt];
 }
 
-// stack[from] hesaplıyken stack[to]'yu (from < to) hesapla. Ara hamlelerin tahtası
-// elimizde yok: şah yolda oynadıysa ya da bir fark listesi taştıysa sadece to ==
-// şimdiki pozisyonken yapılabilir (Finny / sıfırdan); değilse false.
-bool Evaluator::step(const Position& pos, int from, int to, Color persp) {
-    const bool current = to == pos.state_index();
-    const Square ksq = pos.threat_delta(to).ksq[persp];
-    bool kingMoved = false;
-    for (int k = from + 1; k <= to; ++k) kingMoved |= pos.threat_delta(k).ksq[persp] != pos.threat_delta(k - 1).ksq[persp];
-    const bool longSpan = to - from > MaxSpan;
-    if ((kingMoved || longSpan) && !current) return false;
-
-    Accumulator& out = stack[to];
-    const Accumulator& in = stack[from];
-
-    // Tehdit + piyon çifti: yön (şahın tahtanın hangi yarısında olduğu) aynıysa fark
-    RowDelta dt;
-    const bool sameOrient = other_orient(persp, in.ksq[persp]) == other_orient(persp, ksq) && !longSpan;
-    if (sameOrient && other_changes(pos, from, to, persp, ksq, dt.add8, dt.sub8)) {
-        rows += dt.add8.n + dt.sub8.n;
-        apply_delta(out.thr[persp], in.thr[persp], dt);
-        apply_delta_psqt(out.psqtThr[persp], in.psqtThr[persp], dt, nullptr, nullptr);
-    } else if (current)
-        refresh_threats(pos, to, persp);
-    else
-        return false;
-
-    // HalfKA: şah oynadıysa (ya da yol uzunsa) Finny tablosundan, yoksa yoldaki taş değişimleri
-    if (kingMoved || longSpan) refresh_psq(pos, to, persp);
-    else {
-        ++updates;
-        FeatureCtx ctx(persp, ksq);
-        RowDelta d;
-        const int32_t* addP[3 * MaxSpan];
-        const int32_t* subP[3 * MaxSpan];
-        for (int k = from + 1; k <= to; ++k) {
-            const DirtyPiece& dp = pos.state_at(k).dirty;
-            for (int i = 0; i < dp.count; ++i) {
-                if (dp.from[i] != SQ_NONE) {
-                    const int f = ctx.index(dp.from[i], dp.piece[i]);
-                    subP[d.nSub16] = net->psqPsqt + size_t(f) * PsqtBuckets;
-                    d.sub16[d.nSub16++] = net->psqWeight + size_t(f) * HalfDims;
-                }
-                if (dp.to[i] != SQ_NONE) {
-                    const int t = ctx.index(dp.to[i], dp.piece[i]);
-                    addP[d.nAdd16] = net->psqPsqt + size_t(t) * PsqtBuckets;
-                    d.add16[d.nAdd16++] = net->psqWeight + size_t(t) * HalfDims;
-                }
-            }
+// Bir hamlenin HalfKA farkı (forward: hamleyi uygula, değilse geri al)
+void dirty_diff(const DirtyPiece& dp, const FeatureCtx& ctx, RowDelta& d, bool forward) {
+    for (int i = 0; i < dp.count; ++i) {
+        if (dp.from[i] != SQ_NONE) {
+            const int f = ctx.index(dp.from[i], dp.piece[i]);
+            forward ? d.sub_psq(f) : d.add_psq(f);
         }
-        apply_delta(out.psq[persp], in.psq[persp], d);
-        apply_delta_psqt(out.psqtPsq[persp], in.psqtPsq[persp], d, addP, subP);
+        if (dp.to[i] != SQ_NONE) {
+            const int t = ctx.index(dp.to[i], dp.piece[i]);
+            forward ? d.add_psq(t) : d.sub_psq(t);
+        }
     }
-    out.key[persp] = pos.state_at(to).key;
-    out.ksq[persp] = ksq;
+}
+
+}  // namespace
+
+// HalfKA kısmı Finny tablosundan, tehdit + piyon çifti şimdiki tahtadan sıfırdan
+void Evaluator::refresh(const Position& pos, int idx, Color persp) {
+    ++refreshes;
+    const Square ksq = pos.king_square(persp);
+    FinnyEntry& e = finny[int(persp) * SQUARE_NB + int(ksq)];
+    Bitboard byColor[COLOR_NB], byType[PIECE_TYPE_NB];
+    for (Color c : {WHITE, BLACK}) byColor[c] = pos.pieces(c);
+    for (PieceType pt = PAWN; pt <= KING; pt = PieceType(pt + 1)) byType[pt] = pos.pieces(pt);
+    finny_update(e, byColor, byType, FeatureCtx(persp, ksq));
+
+    RowDelta t;
+    active_other(persp, ksq, pos, t.add8);
+    rows += t.add8.n;
+    Accumulator& acc = stack[idx];
+    apply_delta(acc.acc[persp], e.acc, t);
+    apply_delta_psqt(acc.psqt[persp], e.psqt, t);
+    acc.key[persp] = pos.state_at(idx).key;
+}
+
+// Tek hamlelik fark: k-1 hesaplı, k'yı hesapla (aradaki hamlede bu bakışın şahı oynamadı)
+bool Evaluator::forward(const Position& pos, int k, Color persp) {
+    const Square ksq = pos.threat_delta(k).ksq[persp];
+    RowDelta d;
+    if (!other_changes(pos, k, persp, ksq, d.add8, d.sub8)) return false;
+    dirty_diff(pos.state_at(k).dirty, FeatureCtx(persp, ksq), d, true);
+    ++updates;
+    rows += d.add8.n + d.sub8.n;
+    apply_delta(stack[k].acc[persp], stack[k - 1].acc[persp], d);
+    apply_delta_psqt(stack[k].psqt[persp], stack[k - 1].psqt[persp], d);
+    stack[k].key[persp] = pos.state_at(k).key;
     return true;
 }
 
-// Tembel güncelleme: geriye doğru hesaplanmış en yakın ataya git, oradan ileri her
-// hamleyi tek tek hesaplayıp sakla (Stockfish gibi). Böylece bu yolun altındaki
-// diğer düğümler de tek hamlelik farkla başlar; aynı uzun fark tekrar tekrar
-// hesaplanmaz (ör. iterative deepening'de TT'den değer alan düğümlerin altı).
-// Ara hamlede şah oynadıysa oradan sonrası şimdiki pozisyonda tek adımda yapılır.
+// Geriye doğru: k+1 hesaplı, k'yı hesapla (k+1'e giden hamlede bu bakışın şahı oynamadı).
+// Tazelemeden sonra yoldaki durumları doldurur; kardeş düğümler oradan başlar.
+bool Evaluator::backward(const Position& pos, int k, Color persp) {
+    const Square ksq = pos.threat_delta(k + 1).ksq[persp];
+    RowDelta d;
+    if (!other_changes(pos, k + 1, persp, ksq, d.sub8, d.add8)) return false;
+    dirty_diff(pos.state_at(k + 1).dirty, FeatureCtx(persp, ksq), d, false);
+    ++updates;
+    rows += d.add8.n + d.sub8.n;
+    apply_delta(stack[k].acc[persp], stack[k + 1].acc[persp], d);
+    apply_delta_psqt(stack[k].psqt[persp], stack[k + 1].psqt[persp], d);
+    stack[k].key[persp] = pos.state_at(k).key;
+    return true;
+}
+
+// Son hamlede bu bakışın şahı tahtanın aynı yarısında oynadı (Stockfish 19'daki "hybrid"):
+// tehditlerin yönü değişmez. Yeni = yeni şahın Finny kaydı + önceki accumulator
+//   - eski şahın Finny kaydı (önceki dizilime getirilmiş hali), artı tehdit farkı.
+bool Evaluator::hybrid(const Position& pos, int idx, Color persp) {
+    const DirtyPiece& dp = pos.state_at(idx).dirty;
+    const Square oldKsq = dp.from[0], newKsq = dp.to[0];
+
+    RowDelta d;
+    if (!other_changes(pos, idx, persp, newKsq, d.add8, d.sub8)) return false;
+    ++refreshes;
+
+    Bitboard byColor[COLOR_NB], byType[PIECE_TYPE_NB];
+    for (Color c : {WHITE, BLACK}) byColor[c] = pos.pieces(c);
+    for (PieceType pt = PAWN; pt <= KING; pt = PieceType(pt + 1)) byType[pt] = pos.pieces(pt);
+    FinnyEntry& newEntry = finny[int(persp) * SQUARE_NB + int(newKsq)];
+    finny_update(newEntry, byColor, byType, FeatureCtx(persp, newKsq));
+
+    // Önceki dizilim: şah geri, alınan taş yerine
+    const Bitboard kingMove = square_bb(oldKsq) | square_bb(newKsq);
+    byColor[persp] ^= kingMove;
+    byType[KING] ^= kingMove;
+    if (dp.count == 2) {
+        byColor[color_of(dp.piece[1])] |= square_bb(dp.from[1]);
+        byType[type_of(dp.piece[1])] |= square_bb(dp.from[1]);
+    }
+    const FinnyEntry& oldEntry = finny[int(persp) * SQUARE_NB + int(oldKsq)];
+    d.add_raw(stack[idx - 1].acc[persp], stack[idx - 1].psqt[persp]);
+    d.sub_raw(oldEntry.acc, oldEntry.psqt);
+    finny_diff(oldEntry, byColor, byType, FeatureCtx(persp, oldKsq), d, true);
+
+    rows += d.add8.n + d.sub8.n;
+    apply_delta(stack[idx].acc[persp], newEntry.acc, d);
+    apply_delta_psqt(stack[idx].psqt[persp], newEntry.psqt, d);
+    stack[idx].key[persp] = pos.state_at(idx).key;
+    return true;
+}
+
+// Tembel güncelleme (Stockfish 19 gibi): geriye doğru ilk hesaplı durumu ya da bu bakışın
+// şahının oynadığı hamleyi bul. Hesaplı durum bulunduysa oradan ileri her hamleyi tek tek
+// hesaplayıp sakla. Şah oynadıysa: son hamleyse ve aynı yarıdaysa hybrid, değilse şimdiki
+// pozisyonu tazele ve aradaki durumları geriye doğru doldur.
 void Evaluator::update(const Position& pos, int idx, Color persp) {
     auto valid = [&](int j) { return stack[j].key[persp] == pos.state_at(j).key; };
     if (valid(idx)) return;
+    const Piece ourKing = make_piece(persp, KING);
+    auto kingMoved = [&](int j) {
+        const DirtyPiece& dp = pos.state_at(j).dirty;
+        return dp.count > 0 && dp.piece[0] == ourKing;
+    };
 
-    int j = idx - 1;
-    while (j >= 0 && !valid(j)) --j;
-    if (j < 0) {  // kullanılabilir ata yok: baştan
-        refresh_psq(pos, idx, persp);
-        refresh_threats(pos, idx, persp);
-        stack[idx].key[persp] = pos.state_at(idx).key;
-        stack[idx].ksq[persp] = pos.king_square(persp);
+    int j = idx;
+    while (!valid(j) && j > 0 && !kingMoved(j)) --j;
+
+    if (valid(j)) {
+        for (int k = j + 1; k <= idx; ++k)
+            if (!forward(pos, k, persp)) {  // fark listesi taştı (çok nadir)
+                refresh(pos, idx, persp);
+                for (int b = idx - 1; b >= k && backward(pos, b, persp); --b) {}
+                return;
+            }
         return;
     }
-    while (j + 1 < idx && step(pos, j, j + 1, persp)) ++j;
-    step(pos, j, idx, persp);
+
+    if (j == idx && idx > 0 && valid(idx - 1) && popcount(pos.pieces()) >= 15) {
+        const DirtyPiece& dp = pos.state_at(idx).dirty;
+        const bool castling = dp.count == 2 && dp.to[1] != SQ_NONE;
+        if (!castling && (int(dp.from[0]) & 4) == (int(dp.to[0]) & 4) && hybrid(pos, idx, persp)) return;
+    }
+
+    refresh(pos, idx, persp);
+    for (int b = idx - 1; b >= j && backward(pos, b, persp); --b) {}
 }
 
 Output Evaluator::evaluate(const Position& pos) {
@@ -763,8 +827,7 @@ Output Evaluator::evaluate(const Position& pos) {
     const Accumulator& a = stack[idx];
     const Color us = pos.side_to_move(), them = ~us;
     const int bucket = (popcount(pos.pieces()) - 1) / 4;
-    return output(a.psq[us], a.thr[us], a.psq[them], a.thr[them], a.psqtPsq[us][bucket] + a.psqtThr[us][bucket],
-                  a.psqtPsq[them][bucket] + a.psqtThr[them][bucket], bucket);
+    return output(a.acc[us], a.acc[them], a.psqt[us][bucket], a.psqt[them][bucket], bucket);
 }
 
 }  // namespace mai::NNUE

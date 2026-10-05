@@ -30,13 +30,13 @@ constexpr int L2 = 32;  // fc0 çıkışı (son ikisi farkı doğrudan çıkış
 constexpr int L3 = 32;  // fc1 çıkışı
 
 constexpr int MaxThreats = 256;  // bir pozisyondaki etkin tehdit sayısı sınırı
-constexpr int MaxSpan = 8;       // ata bundan uzaksa baştan kurmak daha ucuz
 
 constexpr const char* DefaultNetName = "nn-1a298aa575a0.nnue";
 
 // Ağı yükler; hata varsa açıklamasını err'e yazar.
 bool load(const std::string& path, std::string* err = nullptr);
 bool loaded();
+bool has_psqt();  // ağın psqt çıkışı var mı (SF19: var, SFNNv17: yok)
 const std::string& description();
 
 // Ağın iki parçası, Stockfish'in iç ölçeğinde, sırası gelen tarafın gözünden
@@ -45,17 +45,12 @@ struct Output {
     int sum() const { return psqt + positional; }
 };
 
-// Bir pozisyonun iki bakıştan ilk katman toplamları, iki parça halinde. Ağa giden
-// toplam = psq + thr. Ayrı tutmanın nedeni: şah oynayınca HalfKA kısmı Finny
-// tablosundan tazelenir ama şah tahtanın ortasını geçmedikçe tehditler aynı
-// yönde kalır ve artımlı güncellenmeye devam eder.
+// Bir pozisyonun iki bakıştan ilk katman toplamı (bias + HalfKA + tehdit + piyon çifti),
+// Stockfish 19'daki gibi tek dizide: her güncelleme tek geçişte okunup yazılır.
 struct alignas(64) Accumulator {
-    int16_t psq[COLOR_NB][HalfDims];  // HalfKAv2_hm + bias
-    int16_t thr[COLOR_NB][HalfDims];  // tehdit + piyon çifti
-    int32_t psqtPsq[COLOR_NB][PsqtBuckets];
-    int32_t psqtThr[COLOR_NB][PsqtBuckets];
-    Key key[COLOR_NB];      // bu kayıt hangi pozisyon için hesaplandı (0 = geçersiz)
-    Square ksq[COLOR_NB];   // hesaplandığında bakışın şah karesi
+    int16_t acc[COLOR_NB][HalfDims];
+    int32_t psqt[COLOR_NB][PsqtBuckets];
+    Key key[COLOR_NB];  // bu kayıt hangi pozisyon için hesaplandı (0 = geçersiz)
 };
 
 // Finny tablosu: her (bakış, şah karesi) için en son görülen taş dizilimi ve
@@ -79,9 +74,10 @@ public:
 
 private:
     void update(const Position& pos, int idx, Color persp);
-    bool step(const Position& pos, int from, int to, Color persp);
-    void refresh_psq(const Position& pos, int idx, Color persp);
-    void refresh_threats(const Position& pos, int idx, Color persp);
+    bool forward(const Position& pos, int k, Color persp);   // k-1 hesaplı -> k
+    bool backward(const Position& pos, int k, Color persp);  // k+1 hesaplı -> k
+    bool hybrid(const Position& pos, int idx, Color persp);  // şah aynı yarıda oynadı
+    void refresh(const Position& pos, int idx, Color persp); // Finny + tüm tehditler
 
     std::vector<Accumulator> stack;  // pos.state_index() ile indekslenir
     std::vector<FinnyEntry> finny;   // [renk][şah karesi]

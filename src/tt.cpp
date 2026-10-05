@@ -12,17 +12,26 @@ namespace mai {
 
 TranspositionTable TT;
 
+uint8_t TTEntry::relative_age() const {
+    return uint8_t((TranspositionTable::GENERATION_CYCLE + TT.generation8 - genBound8)
+                   & TranspositionTable::GENERATION_MASK);
+}
+
 void TTEntry::save(Key k, Value v, bool pv, Bound b, Depth d, Move m, Value ev) {
     // Aynı pozisyon için yeni hamle yoksa eskisini koru
     if (m || uint16_t(k) != key16) move16 = m.raw();
 
-    // Değerli bilgiyi silme: tam değer, farklı pozisyon, ya da yeterince derin ise yaz
-    if (b == BOUND_EXACT || uint16_t(k) != key16 || d - DEPTH_OFFSET + 2 * pv > depth8 - 4) {
+    // Değerli bilgiyi silme: tam değer, farklı pozisyon, eski arama ya da yeterince derin ise yaz
+    if (b == BOUND_EXACT || uint16_t(k) != key16 || d - DEPTH_NONE + 2 * pv > depth8 - 4 || relative_age()) {
         key16 = uint16_t(k);
-        depth8 = uint8_t(d - DEPTH_OFFSET);
+        depth8 = uint8_t(d - DEPTH_NONE);
         genBound8 = uint8_t(TT.generation8 | uint8_t(pv) << 2 | b);
         value16 = int16_t(v);
         eval16 = int16_t(ev);
+    }
+    // Yazılmadıysa: kesin olmayan mat/tablo skorlarının derinliğini yavaşça azalt
+    else if (depth8 + DEPTH_NONE >= 5 && Bound(genBound8 & 0x3) != BOUND_EXACT) {
+        if (std::abs(value16) < VALUE_INFINITE && is_decisive(value16)) depth8 = uint8_t(std::max(int(depth8) - 1, 0));
     }
 }
 
@@ -53,25 +62,24 @@ void TranspositionTable::clear() {
     generation8 = 0;
 }
 
-TTEntry* TranspositionTable::probe(Key key, bool& found) const {
+TTEntry* TranspositionTable::probe(Key key, bool& found, TTData& data) const {
     TTEntry* const tte = first_entry(key);
     const uint16_t key16 = uint16_t(key);
 
     for (int i = 0; i < ClusterSize; ++i)
-        if (tte[i].key16 == key16 || !tte[i].depth8) {
-            // Yaşı tazele (sınır ve PV bitlerini koru)
-            tte[i].genBound8 = uint8_t(generation8 | (tte[i].genBound8 & (GENERATION_DELTA - 1)));
-            return found = bool(tte[i].depth8), &tte[i];
+        if (tte[i].key16 == key16) {
+            found = bool(tte[i].depth8);
+            data = tte[i].read();
+            return &tte[i];
         }
 
-    // Yer yok: en değersiz kaydı seç (sığ ve eski olan)
+    // Yok: en değersiz kaydı seç (sığ ve eski olan)
     TTEntry* replace = tte;
-    auto worth = [&](const TTEntry& e) {
-        return e.depth8 - ((GENERATION_CYCLE + generation8 - e.genBound8) & GENERATION_MASK);
-    };
     for (int i = 1; i < ClusterSize; ++i)
-        if (worth(*replace) > worth(tte[i])) replace = &tte[i];
-    return found = false, replace;
+        if (replace->depth8 - replace->relative_age() > tte[i].depth8 - tte[i].relative_age()) replace = &tte[i];
+    found = false;
+    data = {Move::none(), VALUE_NONE, VALUE_NONE, DEPTH_NONE, BOUND_NONE, false};
+    return replace;
 }
 
 int TranspositionTable::hashfull() const {

@@ -12,22 +12,38 @@
 
 namespace mai::Eval {
 
-// NNUE çıktısını aramaya uygun hale getirir (Stockfish 19'daki gibi):
-//  - ağın iki parçası (psqt / katmanlar) çok ayrışıyorsa pozisyon "karmaşık":
-//    değer biraz kısılır, iyimserlik büyütülür
-//  - taş çoksa değer büyür (oyunsonunda aşırı iyimserlik olmasın)
+// NNUE çıktısını aramaya uygun hale getirir. İki ağ türü, iki formül (Stockfish'teki gibi):
+//  SF19 ağı (psqt'li): iki parça çok ayrışıyorsa pozisyon "karmaşık": değer biraz kısılır,
+//    iyimserlik büyütülür; taş çoksa değer büyür.
+//  SFNNv17 ağı (psqt'siz, SF geliştirme sürümü 49ea5ded): ağ ile kaba materyal aynı yönü
+//    gösteriyorsa pozisyon "kolay": öndeyken kolay pozisyonlar, gerideyken karmaşıklar
+//    tercih edilir; taş çoksa değer büyür.
 //  - 50 hamle sayacı büyüdükçe değer sıfıra çekilir (kısır döngüden kaçın)
 //  - mat / tablo aralığına asla girmez
 inline Value evaluate(const Position& pos, NNUE::Evaluator& ev, int optimism = 0) {
     const NNUE::Output out = ev.evaluate(pos);
-    int nnue = out.sum();
-    const int complexity = std::abs(out.psqt - out.positional);
-    optimism += int(optimism * int64_t(complexity) / 476);
-    nnue -= int(nnue * int64_t(complexity) / 18236);
-
-    const int material = 534 * popcount(pos.pieces(PAWN)) + pos.non_pawn_material();
-    int v = nnue + int((nnue * int64_t(material) + optimism * int64_t(7675)) / 91000);
-    v -= v * pos.rule50() / 199;
+    int v;
+    if (NNUE::has_psqt()) {
+        int nnue = out.sum();
+        const int complexity = std::abs(out.psqt - out.positional);
+        optimism += int(optimism * int64_t(complexity) / 476);
+        nnue -= int(nnue * int64_t(complexity) / 18236);
+        const int material = 534 * popcount(pos.pieces(PAWN)) + pos.non_pawn_material();
+        v = nnue + int((nnue * int64_t(material) + optimism * int64_t(7675)) / 91000);
+        v -= v * pos.rule50() / 199;
+    } else {
+        const int nnue = out.positional;
+        const Color us = pos.side_to_move();
+        const int se = PawnValue * (popcount(pos.pieces(us, PAWN)) - popcount(pos.pieces(~us, PAWN)))
+                     + pos.non_pawn_material(us) - pos.non_pawn_material(~us);
+        const int seNorm = (se * 1024) / (std::abs(se) + 1024);
+        const int nnueNorm = (nnue * 1024) / (std::abs(nnue) + 1024);
+        const int alignment = (seNorm * nnueNorm) / 512;
+        const int base = nnue + (nnue * alignment) / 65536 + (optimism * alignment) / 16384;
+        const int material = 521 * popcount(pos.pieces(PAWN)) + pos.non_pawn_material();
+        v = int(base * int64_t(90649 + material) / 90649);
+        v -= v * pos.rule50() / 189;
+    }
     return std::clamp(v, VALUE_TB_LOSS_IN_MAX_PLY + 1, VALUE_TB_WIN_IN_MAX_PLY - 1);
 }
 

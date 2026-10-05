@@ -37,7 +37,52 @@ void init() {
 
 namespace {
 const std::string PieceChars = " PNBRQK  pnbrqk";
+
+// Marcel van Kervinck'in cuckoo yöntemi (Stockfish'teki gibi): geri alınabilir her
+// taş hamlesinin Zobrist farkı bir tabloda; iki pozisyonun anahtar farkı tablodaysa
+// aralarında tek bir hamle vardır.
+inline int H1(Key h) { return int(h & 0x1fff); }
+inline int H2(Key h) { return int((h >> 16) & 0x1fff); }
+Key cuckoo[8192];
+Move cuckooMove[8192];
+}  // namespace
+
+void Position::init_cuckoo() {
+    std::fill(std::begin(cuckoo), std::end(cuckoo), Key(0));
+    std::fill(std::begin(cuckooMove), std::end(cuckooMove), Move::none());
+    for (int pc = 0; pc < PIECE_NB; ++pc) {
+        const PieceType pt = type_of(Piece(pc));
+        if (pt == NO_PIECE_TYPE || pt == PAWN || pc == 7 || pc == 8) continue;
+        for (Square s1 = SQ_A1; s1 <= SQ_H8; ++s1)
+            for (Square s2 = Square(s1 + 1); s2 <= SQ_H8; ++s2)
+                if (attacks_bb(pt, s1, 0) & square_bb(s2)) {
+                    Move move(s1, s2);
+                    Key key = Zobrist::psq[pc][s1] ^ Zobrist::psq[pc][s2] ^ Zobrist::side;
+                    int i = H1(key);
+                    while (true) {
+                        std::swap(cuckoo[i], key);
+                        std::swap(cuckooMove[i], move);
+                        if (move == Move::none()) break;
+                        i = (i == H1(key)) ? H2(key) : H1(key);
+                    }
+                }
+    }
 }
+
+template <PieceType Pt>
+Bitboard Position::attacks_by(Color c) const {
+    if constexpr (Pt == PAWN)
+        return c == WHITE ? pawn_attacks_bb<WHITE>(pieces(WHITE, PAWN)) : pawn_attacks_bb<BLACK>(pieces(BLACK, PAWN));
+    else {
+        Bitboard threats = 0;
+        for (Bitboard b = pieces(c, Pt); b;) threats |= attacks_bb<Pt>(pop_lsb(b), pieces());
+        return threats;
+    }
+}
+template Bitboard Position::attacks_by<PAWN>(Color) const;
+template Bitboard Position::attacks_by<KNIGHT>(Color) const;
+template Bitboard Position::attacks_by<BISHOP>(Color) const;
+template Bitboard Position::attacks_by<ROOK>(Color) const;
 
 std::string square_to_string(Square s) {
     return std::string{char('a' + file_of(s)), char('1' + rank_of(s))};
@@ -241,6 +286,7 @@ bool Position::set(const std::string& fen) {
     states.push_back(st);
     states.back().key = compute_key();
     states.back().pawnKey = compute_pawn_key();
+    compute_piece_keys(states.back());
     states.back().checkers = attackers_to(king_square(sideToMove)) & pieces(~sideToMove);
     set_check_info(states.back());
     // Hamle sırası olmayan taraf şahta olamaz
@@ -333,6 +379,8 @@ void Position::do_move(Move m) {
         put_piece(pc, to, td);
         put_piece(rook, rto, td);
         k ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to] ^ Zobrist::psq[rook][rfrom] ^ Zobrist::psq[rook][rto];
+        st.nonPawnKey[us] ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to] ^ Zobrist::psq[rook][rfrom]
+                           ^ Zobrist::psq[rook][rto];
         dp.count = 2;
         dp.piece[1] = rook;
         dp.from[1] = rfrom;
@@ -347,6 +395,10 @@ void Position::do_move(Move m) {
             remove_piece(capsq, td);
             k ^= Zobrist::psq[captured][capsq];
             if (type_of(captured) == PAWN) st.pawnKey ^= Zobrist::psq[captured][capsq];
+            else {
+                st.nonPawnKey[them] ^= Zobrist::psq[captured][capsq];
+                if (type_of(captured) <= BISHOP) st.minorPieceKey ^= Zobrist::psq[captured][capsq];
+            }
             st.rule50 = 0;
         }
         if (m.type_of() == PROMOTION) {
@@ -362,6 +414,8 @@ void Position::do_move(Move m) {
             if (m.type_of() == PROMOTION) {
                 Piece promo = make_piece(us, m.promotion_type());
                 k ^= Zobrist::psq[pc][to] ^ Zobrist::psq[promo][to];
+                st.nonPawnKey[us] ^= Zobrist::psq[promo][to];
+                if (type_of(promo) <= BISHOP) st.minorPieceKey ^= Zobrist::psq[promo][to];
                 dp.to[0] = SQ_NONE;  // piyon kalktı, terfi taşı geldi
                 dp.piece[dp.count] = promo;
                 dp.from[dp.count] = SQ_NONE;
@@ -378,6 +432,9 @@ void Position::do_move(Move m) {
                     }
                 }
             }
+        } else {
+            st.nonPawnKey[us] ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];
+            if (type_of(pc) <= BISHOP) st.minorPieceKey ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];
         }
     }
 
@@ -398,6 +455,16 @@ void Position::do_move(Move m) {
     ++gamePly;
     st.checkers = attackers_to(king_square(them)) & pieces(us);
     set_check_info(st);
+
+    // Tekrar bilgisi: aynı pozisyonun önceki geçişine uzaklık (o da tekrarsa negatif)
+    st.repetition = 0;
+    const int n = int(states.size());  // yeni durumun indeksi
+    const int end = std::min(st.rule50, st.pliesFromNull);
+    for (int i = 4; i <= end; i += 2)
+        if (states[n - i].key == st.key) {
+            st.repetition = states[n - i].repetition ? -i : i;
+            break;
+        }
     states.push_back(st);
 }
 
@@ -437,6 +504,7 @@ void Position::do_null_move() {
     st.key = k;
     ++st.rule50;
     st.pliesFromNull = 0;
+    st.repetition = 0;
     st.captured = NO_PIECE;
     st.checkers = 0;
     st.dirty.count = 0;
@@ -466,14 +534,36 @@ bool Position::is_draw(int ply) const {
         if (MoveList<LEGAL>(*this).size()) return true;
     }
     // Tekrar: arama ağacının içindeki ilk tekrar beraberlik sayılır,
-    // kökten önceki geçmişte ise üç kez tekrar gerekir.
+    // kökten önceki geçmişte ise üç kez tekrar gerekir (repetition negatif).
+    return st.repetition && st.repetition < ply;
+}
+
+bool Position::upcoming_repetition(int ply) const {
     const int n = int(states.size()) - 1;
-    const int end = std::min({st.rule50, st.pliesFromNull, n});
-    int count = 0;
-    for (int i = 4; i <= end; i += 2) {
-        if (states[n - i].key == st.key) {
-            if (i < ply) return true;  // ağaç içinde
-            if (++count == 2) return true;
+    const StateInfo& st = states[n];
+    const int end = std::min(st.rule50, st.pliesFromNull);
+    if (end < 3) return false;
+
+    const Key originalKey = st.key;
+    int j = n - 1;
+    Key other = originalKey ^ states[j].key ^ Zobrist::side;
+
+    for (int i = 3; i <= end; i += 2) {
+        --j;
+        other ^= states[j].key ^ states[j - 1].key ^ Zobrist::side;
+        --j;
+        if (other != 0) continue;
+
+        const Key moveKey = originalKey ^ states[j].key;
+        int h = H1(moveKey);
+        if (cuckoo[h] == moveKey || (h = H2(moveKey), cuckoo[h] == moveKey)) {
+            const Move move = cuckooMove[h];
+            const Square s1 = move.from_sq(), s2 = move.to_sq();
+            if (!(between_bb(s1, s2) & pieces())) {
+                if (ply > i) return true;
+                // Kökte ya da öncesinde: gerçekten tekrar mı (yoksa sadece o pozisyona hamle mi)
+                if (states[j].repetition) return true;
+            }
         }
     }
     return false;
@@ -539,9 +629,9 @@ bool Position::see_ge(Move m, int threshold) const {
     if (m.type_of() != NORMAL) return 0 >= threshold;
 
     const Square from = m.from_sq(), to = m.to_sq();
-    int swap = PieceValueMg[board[to]] - threshold;
+    int swap = PieceValue[board[to]] - threshold;
     if (swap < 0) return false;
-    swap = PieceValueMg[board[from]] - swap;
+    swap = PieceValue[board[from]] - swap;
     if (swap <= 0) return true;
 
     Bitboard occ = pieces() ^ square_bb(from) ^ square_bb(to);
@@ -562,22 +652,22 @@ bool Position::see_ge(Move m, int threshold) const {
         res ^= 1;
         // En değersiz taşla al
         if ((bb = stmAttackers & pieces(PAWN))) {
-            if ((swap = PawnValueMg - swap) < res) break;
+            if ((swap = PawnValue - swap) < res) break;
             occ ^= bb & -bb;
             attackers |= attacks_bb<BISHOP>(to, occ) & pieces(BISHOP, QUEEN);
         } else if ((bb = stmAttackers & pieces(KNIGHT))) {
-            if ((swap = KnightValueMg - swap) < res) break;
+            if ((swap = KnightValue - swap) < res) break;
             occ ^= bb & -bb;
         } else if ((bb = stmAttackers & pieces(BISHOP))) {
-            if ((swap = BishopValueMg - swap) < res) break;
+            if ((swap = BishopValue - swap) < res) break;
             occ ^= bb & -bb;
             attackers |= attacks_bb<BISHOP>(to, occ) & pieces(BISHOP, QUEEN);
         } else if ((bb = stmAttackers & pieces(ROOK))) {
-            if ((swap = RookValueMg - swap) < res) break;
+            if ((swap = RookValue - swap) < res) break;
             occ ^= bb & -bb;
             attackers |= attacks_bb<ROOK>(to, occ) & pieces(ROOK, QUEEN);
         } else if ((bb = stmAttackers & pieces(QUEEN))) {
-            if ((swap = QueenValueMg - swap) < res) break;
+            if ((swap = QueenValue - swap) < res) break;
             occ ^= bb & -bb;
             attackers |= (attacks_bb<BISHOP>(to, occ) & pieces(BISHOP, QUEEN))
                        | (attacks_bb<ROOK>(to, occ) & pieces(ROOK, QUEEN));
@@ -595,6 +685,36 @@ bool Position::legal_move(Move m) const {
     if (!m.is_ok()) return false;
     const Piece pc = board[m.from_sq()];
     if (pc == NO_PIECE || color_of(pc) != sideToMove) return false;
+
+    // Sık durum (normal hamle) liste üretmeden: hareket kuralı + şah/açmaz kontrolü
+    if (m.type_of() == NORMAL) {
+        if ((m.raw() >> 12) & 3) return false;  // normal hamlede terfi bitleri boş olmalı
+        const Color us = sideToMove;
+        const Square from = m.from_sq(), to = m.to_sq();
+        const Bitboard toBB = square_bb(to), occ = pieces();
+        if (pieces(us) & toBB) return false;
+        const PieceType pt = type_of(pc);
+
+        if (pt == PAWN) {
+            if (relative_rank(us, rank_of(to)) == RANK_8) return false;  // terfi NORMAL olamaz
+            const Direction up = pawn_push(us);
+            const bool ok = (pawn_attacks(us, from) & pieces(~us) & toBB)
+                         || (to == from + up && !(occ & toBB))
+                         || (to == from + up + up && relative_rank(us, rank_of(from)) == RANK_2
+                             && !(occ & (toBB | square_bb(from + up))));
+            if (!ok) return false;
+        } else if (!(attacks_bb(pt, from, occ) & toBB))
+            return false;
+
+        if (pt == KING) return !(attackers_to(to, occ ^ square_bb(from)) & pieces(~us));
+
+        const Square ksq = king_square(us);
+        if (const Bitboard chk = checkers()) {
+            if (more_than_one(chk)) return false;
+            if (!((between_bb(ksq, lsb(chk)) | chk) & toBB)) return false;  // şahı kapatmalı ya da almalı
+        }
+        return !(blockers_for_king(us) & square_bb(from)) || aligned(from, to, ksq);
+    }
     // Hamle üreticisi hangi listeye koyuyorsa orada ara (garip TT hamleleri hiçbirinde yoktur)
     if (capture_stage(m)) return MoveList<CAPTURES>(*this).contains(m);
     return MoveList<QUIETS>(*this).contains(m);
@@ -608,6 +728,17 @@ Key Position::compute_key() const {
     }
     if (ep_square() != SQ_NONE) k ^= Zobrist::enpassant[file_of(ep_square())];
     return k ^ Zobrist::castling[castling_rights()];
+}
+
+void Position::compute_piece_keys(StateInfo& st) const {
+    st.minorPieceKey = 0;
+    st.nonPawnKey[WHITE] = st.nonPawnKey[BLACK] = 0;
+    for (Bitboard b = pieces() & ~pieces(PAWN); b;) {
+        const Square s = pop_lsb(b);
+        const Piece pc = board[s];
+        st.nonPawnKey[color_of(pc)] ^= Zobrist::psq[pc][s];
+        if (type_of(pc) <= BISHOP) st.minorPieceKey ^= Zobrist::psq[pc][s];
+    }
 }
 
 Key Position::compute_pawn_key() const {
@@ -637,6 +768,13 @@ bool Position::pos_is_ok(std::string* why) const {
     if (popcount(pieces(WHITE, KING)) != 1 || popcount(pieces(BLACK, KING)) != 1) return fail("şah sayısı");
     if (key() != compute_key()) return fail("zobrist anahtarı yanlış");
     if (pawn_key() != compute_pawn_key()) return fail("piyon anahtarı yanlış");
+    {
+        StateInfo tmp{};
+        compute_piece_keys(tmp);
+        if (tmp.minorPieceKey != minor_piece_key() || tmp.nonPawnKey[WHITE] != non_pawn_key(WHITE)
+            || tmp.nonPawnKey[BLACK] != non_pawn_key(BLACK))
+            return fail("taş anahtarları yanlış");
+    }
     if (checkers() != (attackers_to(king_square(sideToMove)) & pieces(~sideToMove))) return fail("checkers yanlış");
     if (attackers_to(king_square(~sideToMove)) & pieces(sideToMove)) return fail("rakip şah tehdit altında");
     return true;

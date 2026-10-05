@@ -14,26 +14,34 @@ using Key = uint64_t;
 constexpr int MAX_MOVES = 256;
 constexpr int MAX_PLY = 246;
 
-// Değerler (Stockfish ölçeği: 208 = bir piyon)
+// Değerler (Stockfish 19 ölçeği: 208 = bir piyon)
 using Value = int;
 constexpr Value VALUE_ZERO = 0;
 constexpr Value VALUE_DRAW = 0;
-constexpr Value VALUE_KNOWN_WIN = 10000;
 constexpr Value VALUE_MATE = 32000;
 constexpr Value VALUE_INFINITE = 32001;
 constexpr Value VALUE_NONE = 32002;
-constexpr Value VALUE_TB_WIN_IN_MAX_PLY = VALUE_MATE - 2 * MAX_PLY;
-constexpr Value VALUE_TB_LOSS_IN_MAX_PLY = -VALUE_TB_WIN_IN_MAX_PLY;
 constexpr Value VALUE_MATE_IN_MAX_PLY = VALUE_MATE - MAX_PLY;
 constexpr Value VALUE_MATED_IN_MAX_PLY = -VALUE_MATE_IN_MAX_PLY;
+constexpr Value VALUE_TB = VALUE_MATE_IN_MAX_PLY - 1;
+constexpr Value VALUE_TB_WIN_IN_MAX_PLY = VALUE_TB - MAX_PLY;
+constexpr Value VALUE_TB_LOSS_IN_MAX_PLY = -VALUE_TB_WIN_IN_MAX_PLY;
+
+constexpr bool is_valid(Value v) { return v != VALUE_NONE; }
+constexpr bool is_win(Value v) { return v >= VALUE_TB_WIN_IN_MAX_PLY; }
+constexpr bool is_loss(Value v) { return v <= VALUE_TB_LOSS_IN_MAX_PLY; }
+constexpr bool is_decisive(Value v) { return is_win(v) || is_loss(v); }
+constexpr bool is_mate(Value v) { return v >= VALUE_MATE_IN_MAX_PLY; }
+constexpr bool is_mated(Value v) { return v <= VALUE_MATED_IN_MAX_PLY; }
+constexpr bool is_mate_or_mated(Value v) { return is_mate(v) || is_mated(v); }
 
 constexpr Value mate_in(int ply) { return VALUE_MATE - ply; }
 constexpr Value mated_in(int ply) { return -VALUE_MATE + ply; }
 
 using Depth = int;
 constexpr Depth DEPTH_QS = 0;
-constexpr Depth DEPTH_NONE = -6;
-constexpr Depth DEPTH_OFFSET = -7;  // TT'de derinlik bu kadar kaydırılarak saklanır
+constexpr Depth DEPTH_UNSEARCHED = -2;  // sadece statik değerlendirme saklanan TT kaydı
+constexpr Depth DEPTH_NONE = -3;        // TT'de derinlik bu kadar kaydırılarak saklanır (0 = boş)
 
 enum Color : int { WHITE, BLACK, COLOR_NB = 2 };
 constexpr Color operator~(Color c) { return Color(c ^ 1); }

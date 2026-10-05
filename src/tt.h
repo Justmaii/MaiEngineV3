@@ -5,10 +5,12 @@
 // satırının yarısına sığar. Kayıt: anahtarın 16 biti, derinlik, yaş+PV+sınır,
 // hamle, değer, statik değerlendirme.
 // Değiştirme: aynı anahtar yoksa "derinlik - 8 * yaş" en küçük olan gider.
+// Kurallar Stockfish 19'daki gibi.
 // Lazy SMP'de kilitsiz; yarış olursa en kötü ihtimalle hamle legal_move ile elenir.
 #pragma once
 
 #include <cstddef>
+#include <algorithm>
 #include <cstdint>
 
 #include "types.h"
@@ -17,17 +19,27 @@ namespace mai {
 
 enum Bound : uint8_t { BOUND_NONE = 0, BOUND_UPPER = 1, BOUND_LOWER = 2, BOUND_EXACT = 3 };
 
+// Bir TT kaydının okunduğu andaki kopyası (aramada kayıt sonradan değişebilir)
+struct TTData {
+    Move move;
+    Value value, eval;
+    Depth depth;
+    Bound bound;
+    bool isPv;
+};
+
 struct TTEntry {
-    Move move() const { return Move(move16); }
-    Value value() const { return value16; }
-    Value eval() const { return eval16; }
-    Depth depth() const { return Depth(depth8) + DEPTH_OFFSET; }
-    bool is_pv() const { return genBound8 & 0x4; }
-    Bound bound() const { return Bound(genBound8 & 0x3); }
+    TTData read() const {
+        return {Move(move16), Value(value16), Value(eval16), Depth(depth8) + DEPTH_NONE, Bound(genBound8 & 0x3),
+                bool(genBound8 & 0x4)};
+    }
     void save(Key k, Value v, bool pv, Bound b, Depth d, Move m, Value ev);
+    // Eşleşmeyen sınır yüzünden kesme yapılamayan kaydın derinliğini düşür
+    void penalize(int penalty) { depth8 = uint8_t(std::max(int(depth8) - penalty, 0)); }
 
 private:
     friend class TranspositionTable;
+    uint8_t relative_age() const;
     uint16_t key16;
     uint8_t depth8;
     uint8_t genBound8;
@@ -56,7 +68,8 @@ public:
     void clear();
     void new_search() { generation8 += GENERATION_DELTA; }
     uint8_t generation() const { return generation8; }
-    TTEntry* probe(Key key, bool& found) const;
+    // Kaydı bulur ya da yerine yazılacak kaydı seçer; found ve data okunanı verir
+    TTEntry* probe(Key key, bool& found, TTData& data) const;
     int hashfull() const;  // binde doluluk
     void prefetch(Key key) const { __builtin_prefetch(first_entry(key)); }
 

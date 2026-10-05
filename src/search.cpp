@@ -1,9 +1,12 @@
 // MaiEngine v3 — arama, iş parçacıkları, zaman yönetimi
 // Copyright (C) 2026 Mai (Justmaii). GPLv3, bkz. LICENSE.
 //
-// Yapı ve parametreler Stockfish 15.1'deki aramayı örnek alır (GPLv3,
-// https://github.com/official-stockfish/Stockfish). Kod bizim; formüller ve
-// sabitler oradan uyarlandı. Her budama/uzatma maçla ölçülecek.
+// Arama, Stockfish 19'daki aramanın uyarlamasıdır (GPLv3,
+// https://github.com/official-stockfish/Stockfish), üstüne geliştirme sürümü
+// 49ea5ded'e kadarki arama değişiklikleri: budama, indirgeme ve uzatma
+// kuralları, history ve correction history tabloları, aspiration penceresi,
+// iyimserlik ve zaman yönetimi oradan. Tahta, hamle üretimi, NNUE çıkarımı,
+// iş parçacıkları ve UCI bizim. Tablebase yok, MultiPV yok.
 #include "search.h"
 
 #include <algorithm>
@@ -26,38 +29,40 @@ namespace {
 
 enum NodeType { NonPV, PV, Root };
 
-int Reductions[MAX_MOVES];
-
-Value futility_margin(Depth d, bool improving) { return Value(165 * (d - improving)); }
-
-Depth reduction(bool improving, Depth d, int mn, Value delta, Value rootDelta) {
-    int r = Reductions[std::min(d, MAX_MOVES - 1)] * Reductions[std::min(mn, MAX_MOVES - 1)];
-    return (r + 1449 - int(delta) * 1032 / int(rootDelta)) / 1024 + (!improving && r > 941);
+inline int lmr_divisor(int depth) {
+    const int d = std::min(depth, 16);
+    return 3000 + 7 * (d - 8) * (d - 8);
 }
 
-constexpr int futility_move_count(bool improving, Depth depth) {
-    return improving ? (3 + depth * depth) : (3 + depth * depth) / 2;
+constexpr int SEARCHEDLIST_CAPACITY = 32;
+
+template <typename T1, typename T2>
+constexpr T2 interpolate(T1 x, T1 x0, T1 x1, T2 y0, T2 y1) {
+    return T2(y0 + (y1 - y0) * (x - x0) / (x1 - x0));
 }
 
-int stat_bonus(Depth d) { return std::min((12 * d + 282) * d - 349, 1594); }
+// Correction history düzeltmesini ham değerlendirmeye ekle (mat/tablo aralığına girmeden)
+Value to_corrected_static_eval(Value v, int cv) {
+    return std::clamp(v + cv / 131072, VALUE_TB_LOSS_IN_MAX_PLY + 1, VALUE_TB_WIN_IN_MAX_PLY - 1);
+}
 
 // Tekrar beraberliğinde küçük rastgelelik: arama beraberlik çizgisine kör olmasın
-Value value_draw(const Thread* th) { return VALUE_DRAW - 1 + Value(th->nodes.load(std::memory_order_relaxed) & 0x2); }
+Value value_draw(uint64_t nodes) { return VALUE_DRAW - 1 + Value(nodes & 0x2); }
 
-// Mat skorları TT'de "bu düğümden mat" olarak saklanır
-Value value_to_tt(Value v, int ply) {
-    return v >= VALUE_TB_WIN_IN_MAX_PLY ? v + ply : v <= VALUE_TB_LOSS_IN_MAX_PLY ? v - ply : v;
-}
+// Mat / tablo skorları TT'de "bu düğümden" olarak saklanır
+Value value_to_tt(Value v, int ply) { return is_win(v) ? v + ply : is_loss(v) ? v - ply : v; }
 
+// 50 hamle kuralı yüzünden gerçekleşemeyecek mat skorlarını güvenilmez say
 Value value_from_tt(Value v, int ply, int r50c) {
-    if (v == VALUE_NONE) return VALUE_NONE;
-    if (v >= VALUE_TB_WIN_IN_MAX_PLY) {
-        // 50 hamle kuralı yüzünden gerçekleşemeyecek mat skorlarını güvenilmez say
-        if (v >= VALUE_MATE_IN_MAX_PLY && VALUE_MATE - v > 99 - r50c) return VALUE_MATE_IN_MAX_PLY - 1;
+    if (!is_valid(v)) return VALUE_NONE;
+    if (is_win(v)) {
+        if (is_mate(v) && VALUE_MATE - v > 100 - r50c) return VALUE_TB_WIN_IN_MAX_PLY - 1;
+        if (VALUE_TB - v > 100 - r50c) return VALUE_TB_WIN_IN_MAX_PLY - 1;
         return v - ply;
     }
-    if (v <= VALUE_TB_LOSS_IN_MAX_PLY) {
-        if (v <= VALUE_MATED_IN_MAX_PLY && VALUE_MATE + v > 99 - r50c) return VALUE_MATED_IN_MAX_PLY + 1;
+    if (is_loss(v)) {
+        if (is_mated(v) && VALUE_MATE + v > 100 - r50c) return VALUE_TB_LOSS_IN_MAX_PLY + 1;
+        if (VALUE_TB + v > 100 - r50c) return VALUE_TB_LOSS_IN_MAX_PLY + 1;
         return v + ply;
     }
     return v;
@@ -68,12 +73,32 @@ void update_pv(Move* pv, Move move, const Move* childPv) {
     *pv = Move::none();
 }
 
+// Hamle çiftlerinin (önceki hamleler -> bu hamle) istatistikleri
 void update_continuation_histories(Search::Stack* ss, Piece pc, Square to, int bonus) {
-    for (int i : {1, 2, 4, 6}) {
+    static constexpr int index[6] = {1, 2, 3, 4, 5, 6};
+    static constexpr int weight[6] = {520, 390, 145, 251, 66, 209};
+    // Tutarlı olumlu geçmiş için çarpanlar
+    static constexpr int CMHCMultipliers[] = {94, 103, 110, 106, 119, 126, 121};
+    int positiveCount = 0;
+
+    for (int k = 0; k < 6; ++k) {
+        const int i = index[k];
         // Şahtayken sadece yakın geçmiş anlamlı
         if (ss->inCheck && i > 2) break;
-        if ((ss - i)->currentMove.is_ok()) (*(ss - i)->continuationHistory)(pc, to) << bonus;
+        if ((ss - i)->currentMove.is_ok()) {
+            auto& entry = (*(ss - i)->continuationHistory)(pc, to);
+            if (entry > 0) positiveCount++;
+            entry << bonus * weight[k] * CMHCMultipliers[positiveCount] / 65536 + 73 * (i < 2);
+        }
     }
+}
+
+// Aynı taşı ileri geri oynatan kısır döngüleri tespit et (arama patlamasın)
+bool is_shuffling(Move move, const Search::Stack* ss, const Position& pos) {
+    if (pos.capture_stage(move) || pos.rule50() < 10) return false;
+    if (pos.state().pliesFromNull < 6 || ss->ply < 20) return false;
+    return move.from_sq() == (ss - 2)->currentMove.to_sq()
+        && (ss - 2)->currentMove.from_sq() == (ss - 4)->currentMove.to_sq();
 }
 
 std::string pv_string(const std::vector<Move>& pv) {
@@ -89,19 +114,17 @@ std::string uci_score(Value v, const Position& pos) {
     return "mate " + std::to_string((v > 0 ? VALUE_MATE - v + 1 : -VALUE_MATE - v) / 2);
 }
 
-void Search::init() {
-    for (int i = 1; i < MAX_MOVES; ++i)
-        Reductions[i] = int((20.26 + std::log(double(Threads.size())) / 2) * std::log(double(i)));
-}
+void Search::init() {}
 
 void Search::clear() {
     Threads.main()->wait_for_search_finished();
     TT.clear();
     Threads.clear();
+    Time.originalTimeAdjust = -1;
 }
 
 // ---------------------------------------------------------------------------
-//  Zaman yönetimi
+//  Zaman yönetimi (Stockfish 19)
 // ---------------------------------------------------------------------------
 // 1+0.01 gibi çok kısa sürelerde bile ASLA süreden kaybetmemek esas:
 // maximum = bu hamlede aşılmaması gereken sınır, hard = ne olursa olsun durma sınırı.
@@ -113,21 +136,37 @@ void TimeManagement::init(const Search::LimitsType& limits, Color us, int ply) {
     }
     const TimePoint overhead = Search::options.moveOverhead;
     const TimePoint myTime = limits.time[us], myInc = limits.inc[us];
-    const int mtg = limits.movestogo ? std::min(limits.movestogo, 50) : 50;
+    const TimePoint scaledTime = std::max<TimePoint>(1, myTime);
+
+    int mtg = limits.movestogo ? std::min(limits.movestogo, 50) : 50;
+    // Bir saniyeden az kaldıysa ufku yavaşça kısalt
+    if (scaledTime < 1000 && !limits.movestogo) mtg = int(scaledTime * 0.05);
 
     // Kalan süre tahmini (gelecekteki artışlar dahil, her hamlede overhead düş)
-    TimePoint timeLeft = std::max<TimePoint>(1, myTime + myInc * (mtg - 1) - overhead * (2 + mtg));
+    const TimePoint timeLeft = std::max<TimePoint>(1, myTime + myInc * (mtg - 1) - overhead * (2 + mtg));
 
     double optScale, maxScale;
     if (!limits.movestogo) {
-        optScale = std::min(0.0084 + std::pow(ply + 3.0, 0.5) * 0.0042, 0.2 * myTime / double(timeLeft));
-        maxScale = std::min(7.0, 4.0 + ply / 12.0);
+        if (originalTimeAdjust < 0) originalTimeAdjust = 0.3272 * std::log10(double(timeLeft)) - 0.4141;
+        const double logTimeInSec = std::log10(scaledTime / 1000.0);
+        const double optConstant = std::min(0.0029869 + 0.00033554 * logTimeInSec, 0.004905);
+        const double maxConstant = std::max(3.3744 + 3.0608 * logTimeInSec, 3.1441);
+        optScale = std::min(0.012112 + std::pow(ply + 3.22713, 0.46866) * optConstant,
+                            0.19404 * myTime / double(timeLeft))
+                 * originalTimeAdjust;
+        maxScale = std::min(6.873, maxConstant + ply / 12.352);
     } else {
         optScale = std::min((0.88 + ply / 116.4) / mtg, 0.88 * myTime / double(timeLeft));
-        maxScale = std::min(6.3, 1.5 + 0.11 * mtg);
+        maxScale = 1.3 + 0.11 * mtg;
     }
-    optimumTime = TimePoint(optScale * timeLeft);
-    maximumTime = TimePoint(std::min(0.8 * myTime - overhead, maxScale * optimumTime)) - 10;
+    // Saatte gerideysek daha az düşün (devirli sürede son hamlede değil: hesap yanıltır)
+    if (limits.movestogo != 1) {
+        const double timeAdvantage = (myTime - limits.time[~us]) / (1.0 + myTime + limits.time[~us]);
+        optScale *= 1 + 0.9 * std::min(timeAdvantage, 0.0);
+    }
+    optimumTime = TimePoint(std::max(1.0, optScale * timeLeft));
+    maximumTime = TimePoint(std::max(double(optimumTime), std::min(0.8097 * myTime - overhead, maxScale * optimumTime)));
+
     // Mutlak sınır: saatin sıfırlanmasına asla yaklaşma
     hardTime = std::max<TimePoint>(1, std::min<TimePoint>(myTime - overhead - 5, myTime / 2 + myInc));
     maximumTime = std::clamp<TimePoint>(maximumTime, 1, hardTime);
@@ -151,18 +190,24 @@ Thread::~Thread() {
     stdThread.join();
 }
 
+// Yeni oyun: history'leri Stockfish 19'un başlangıç değerleriyle doldur
 void Thread::clear() {
-    counterMoves.clear();
-    mainHistory.fill(0);
-    captureHistory.fill(0);
+    mainHistory.fill(-5);
+    lowPlyHistory.fill(0);
+    captureHistory.fill(-742);
+    correctionHistory.fill(-5);
+    pawnHistory.fill(-1338);
     for (bool inCheck : {false, true})
-        for (int c : {0, 1}) {
-            continuationHistory[inCheck][c].fill(-71);
-            continuationHistory[inCheck][c](NO_PIECE, SQ_A1).fill(0);  // yığın başındaki nöbetçi
-        }
+        for (int c : {0, 1}) continuationHistory[inCheck][c].fill(-586);
+    ttMoveHistory = 0;
+    continuationCorrectionHistory.fill(5);
+
+    reductions[0] = 0;
+    for (int i = 1; i < MAX_MOVES; ++i) reductions[i] = int(2872 / 128.0 * std::log(double(i)));
+
     evaluator.clear();
     bestPreviousScore = bestPreviousAverageScore = VALUE_INFINITE;
-    previousTimeReduction = 1.0;
+    previousTimeReduction = 0.85;
 }
 
 void Thread::start_searching() {
@@ -249,12 +294,12 @@ void ThreadPool::start_thinking(const Position& pos, const Search::LimitsType& l
     main()->start_searching();
 }
 
-// Oylama: daha derin ve daha iyi skorlu iş parçacığının hamlesi kazanır
+// Oylama: skoru iyi olan iş parçacıklarının hamlesi daha çok oy alır
 Thread* ThreadPool::get_best_thread() const {
     Thread* best = main();
-    if (threads.size() == 1) return best;
-    Value minScore = VALUE_NONE;
+    Value minScore = VALUE_INFINITE;
     for (auto& t : threads) minScore = std::min(minScore, t->rootMoves[0].score);
+
     std::vector<std::pair<Move, int64_t>> votes;
     auto vote_of = [&](Move m) -> int64_t& {
         for (auto& v : votes)
@@ -262,17 +307,23 @@ Thread* ThreadPool::get_best_thread() const {
         votes.emplace_back(m, 0);
         return votes.back().second;
     };
-    for (auto& t : threads) vote_of(t->rootMoves[0].pv[0]) += int64_t(t->rootMoves[0].score - minScore + 14) * t->completedDepth;
+    for (auto& t : threads) vote_of(t->rootMoves[0].pv[0]) += t->rootMoves[0].score - minScore + 14;
 
     for (auto& t : threads) {
-        Thread* th = t.get();
-        const Value bestScore = best->rootMoves[0].score, thScore = th->rootMoves[0].score;
-        if (std::abs(bestScore) >= VALUE_TB_WIN_IN_MAX_PLY) {
-            if (thScore > bestScore) best = th;  // en kısa mat
-        } else if (thScore >= VALUE_TB_WIN_IN_MAX_PLY
-                   || (thScore > VALUE_TB_LOSS_IN_MAX_PLY
-                       && vote_of(th->rootMoves[0].pv[0]) > vote_of(best->rootMoves[0].pv[0])))
-            best = th;
+        const auto& bestMove = best->rootMoves[0];
+        const auto& newMove = t->rootMoves[0];
+        const int64_t bestVote = vote_of(bestMove.pv[0]), newVote = vote_of(newMove.pv[0]);
+        // Yarıda kalan (d1) aramalar kesin olmayan mat skorları verebilir
+        const bool bestDecisive = bestMove.score != -VALUE_INFINITE && is_decisive(bestMove.score) && !bestMove.is_inexact();
+        const bool newDecisive = newMove.score != -VALUE_INFINITE && is_decisive(newMove.score) && !newMove.is_inexact();
+
+        if (bestDecisive) {
+            // En kısa matı seç
+            if (newDecisive && std::abs(newMove.score) > std::abs(bestMove.score)) best = t.get();
+        } else if (newDecisive
+                   || (!is_loss(newMove.score)
+                       && (newVote > bestVote || (newVote == bestVote && newMove.pv.size() > bestMove.pv.size()))))
+            best = t.get();
     }
     return best;
 }
@@ -346,106 +397,223 @@ void Thread::id_loop() {
     Move pv[MAX_PLY + 1];
 
     for (int i = 7; i > 0; --i) {
-        (ss - i)->continuationHistory = &continuationHistory[0][0](NO_PIECE, SQ_A1);
+        (ss - i)->continuationHistory = &continuationHistory[0][0](NO_PIECE, SQ_A1);  // nöbetçi
+        (ss - i)->continuationCorrectionHistory = &continuationCorrectionHistory(NO_PIECE, SQ_A1);
         (ss - i)->staticEval = VALUE_NONE;
     }
     for (int i = 0; i <= MAX_PLY + 2; ++i) (ss + i)->ply = i;
     ss->pv = pv;
 
-    Value bestValue = -VALUE_INFINITE, alpha = -VALUE_INFINITE, beta = VALUE_INFINITE, delta = 0;
-    Move lastBestMove = Move::none();
+    std::vector<Move> lastBestMovePV;
     Depth lastBestMoveDepth = 0;
+    Value lastBestMoveScore = -VALUE_INFINITE;
+    Value bestValue = -VALUE_INFINITE, alpha, beta;
+    const Color us = rootPos.side_to_move();
     double timeReduction = 1, totBestMoveChanges = 0;
-    int iterIdx = 0, searchAgainCounter = 0;
+    int delta, iterIdx = 0, searchAgainCounter = 0, failHighRecovery = 0;
 
-    if (is_main()) {
-        const Value init = bestPreviousScore == VALUE_INFINITE ? VALUE_ZERO : bestPreviousScore;
-        for (auto& v : iterValue) v = init;
-        if (bestPreviousAverageScore == VALUE_INFINITE) bestPreviousAverageScore = VALUE_ZERO;
-    }
+    if (is_main())
+        for (auto& v : iterValue) v = bestPreviousScore == VALUE_INFINITE ? VALUE_ZERO : bestPreviousScore;
+
+    lowPlyHistory.fill(102);
+    for (auto& side : mainHistory.t)
+        for (auto& e : side) e = int(e) * 729 / 1024;
 
     const auto& limits = Threads.limits;
-    while (++rootDepth < MAX_PLY && !Threads.stop && !(limits.depth && is_main() && rootDepth > limits.depth)) {
+    while (rootDepth + 1 < MAX_PLY && !Threads.stop && !(limits.depth && is_main() && rootDepth >= limits.depth)) {
+        ++rootDepth;
         if (is_main()) totBestMoveChanges /= 2;
-        for (auto& rm : rootMoves) rm.previousScore = rm.score;
+
+        for (auto& rm : rootMoves) {
+            rm.previousScore = rm.score;
+            rm.previousPV = rm.pv;
+        }
         pvIdx = 0;
         pvLast = int(rootMoves.size());
         if (!Threads.increaseDepth) ++searchAgainCounter;
+
+        lastIterationIdxPV = rootMoves[0].previousPV;
         selDepth = 0;
 
-        // Aspiration penceresi: önceki skor civarında dar pencere
-        if (rootDepth >= 4) {
-            const Value prev = rootMoves[0].averageScore;
-            delta = Value(10) + int(prev) * prev / 15620;
-            alpha = std::max(prev - delta, -VALUE_INFINITE);
-            beta = std::min(prev + delta, VALUE_INFINITE);
-        }
+        // Aspiration penceresi: kök hamlenin ortalama skoru civarında, skorlar
+        // oynaksa (ortalama kare büyük) daha geniş
+        delta = 5 + int(idx % 8) + std::abs(rootMoves[0].meanSquaredScore) / 10193;
+        const Value avg = rootMoves[0].averageScore;
+        alpha = std::max(avg - delta, -VALUE_INFINITE);
+        beta = std::min(avg + delta, VALUE_INFINITE);
+
+        // İyimserlik: kök skoru iyiyse değerlendirme biraz daha iyimser, kötüyse karamsar
+        optimism[us] = 114 * avg / (std::abs(avg) + 85);
+        optimism[~us] = -optimism[us];
 
         int failedHighCnt = 0;
+        failHighRecovery = std::max(0, failHighRecovery - 2);
         while (true) {
-            const Depth adjustedDepth = std::max(1, rootDepth - failedHighCnt - 3 * (searchAgainCounter + 1) / 4);
-            rootDelta = std::max(1, beta - alpha);
+            const Depth adjustedDepth =
+                std::max(1, rootDepth - failedHighCnt - failHighRecovery - 3 * (searchAgainCounter + 1) / 4);
+            rootDelta = beta - alpha;
             bestValue = search<Root>(rootPos, ss, alpha, beta, adjustedDepth, false);
             std::stable_sort(rootMoves.begin(), rootMoves.end());
             if (Threads.stop) break;
 
             if (bestValue <= alpha) {
-                beta = (alpha + beta) / 2;
+                beta = alpha;
                 alpha = std::max(bestValue - delta, -VALUE_INFINITE);
                 failedHighCnt = 0;
             } else if (bestValue >= beta) {
+                alpha = std::max(beta - delta, alpha);
                 beta = std::min(bestValue + delta, VALUE_INFINITE);
                 ++failedHighCnt;
             } else
                 break;
-            delta += delta / 4 + 2;
+            delta += 47 * delta / 128;
         }
-        std::stable_sort(rootMoves.begin(), rootMoves.end());
+        // Fail high yüzünden sığ arandıysa derinliği yavaş yavaş geri getir
+        if (failedHighCnt > 0) failHighRecovery = (failedHighCnt + 1) / 2 + 2;
 
         if (!Threads.stop) completedDepth = rootDepth;
 
-        if (is_main() && !Threads.silent && (completedDepth == rootDepth)) {
+        if (is_main() && !Threads.silent && !Threads.stop) {
             const auto& rm = rootMoves[0];
             const TimePoint el = std::max<TimePoint>(Time.elapsed(), 1);
             const uint64_t n = Threads.nodes_searched();
-            std::cout << "info depth " << completedDepth << " seldepth " << rm.selDepth << " score "
+            std::cout << "info depth " << rootDepth << " seldepth " << rm.selDepth << " score "
                       << uci_score(rm.uciScore, rootPos)
-                      << (rm.scoreLowerbound ? " lowerbound" : rm.scoreUpperbound ? " upperbound" : "")
-                      << " nodes " << n << " nps " << n * 1000 / el << " hashfull " << TT.hashfull() << " time "
-                      << el << " pv" << pv_string(rm.pv) << std::endl;
+                      << (rm.inexactLower ? " lowerbound" : rm.inexactUpper ? " upperbound" : "") << " nodes " << n
+                      << " nps " << n * 1000 / el << " hashfull " << TT.hashfull() << " time " << el << " pv"
+                      << pv_string(rm.pv) << std::endl;
         }
 
-        if (rootMoves[0].pv[0] != lastBestMove) {
-            lastBestMove = rootMoves[0].pv[0];
-            lastBestMoveDepth = rootDepth;
+        // Önceki iterasyonda bulunan (daha kısa) matı unutma
+        const bool forgottenMate = lastBestMoveScore != -VALUE_INFINITE && is_mate_or_mated(lastBestMoveScore)
+                                && (std::abs(rootMoves[0].score) < std::abs(lastBestMoveScore)
+                                    || rootMoves[0].is_inexact());
+        if (!Threads.stop) {
+            if (lastBestMovePV.empty() || lastBestMovePV[0] != rootMoves[0].pv[0]) lastBestMoveDepth = rootDepth;
+            if (!forgottenMate) {
+                lastBestMovePV = rootMoves[0].pv;
+                lastBestMoveScore = rootMoves[0].score;
+            }
         }
+
+        // Yarıda kalan aramanın kesin kayıp skoruna güvenme: önceki iterasyona dön
+        const bool abortedLossSearch = Threads.stop && rootMoves[0].is_exact_loss();
+        if (abortedLossSearch || (rootMoves[0].score != -VALUE_INFINITE && forgottenMate)) {
+            if (!lastBestMovePV.empty()) {
+                auto it = std::find(rootMoves.begin(), rootMoves.end(), lastBestMovePV[0]);
+                if (it != rootMoves.end()) std::rotate(rootMoves.begin(), it, it + 1);
+                rootMoves[0].score = rootMoves[0].uciScore = lastBestMoveScore;
+                rootMoves[0].pv = lastBestMovePV;
+                rootMoves[0].unset_inexact();
+            } else if (abortedLossSearch)
+                rootMoves[0].inexactLower = true;
+        }
+
+        // İstenen mat bulunduysa dur
+        if (limits.mate && !Threads.stop && is_mate_or_mated(rootMoves[0].score)
+            && VALUE_MATE - std::abs(rootMoves[0].score) <= 2 * limits.mate)
+            Threads.stop = true;
 
         if (!is_main()) continue;
 
-        // İstenen mat bulunduysa dur
-        if (limits.mate && bestValue >= VALUE_MATE_IN_MAX_PLY && VALUE_MATE - bestValue <= 2 * limits.mate)
-            Threads.stop = true;
+        totBestMoveChanges += Threads.take_best_move_changes();
 
-        // Zaman: skor düşüyorsa / en iyi hamle sık değişiyorsa daha çok düşün
+        // Zaman: skor düşüyorsa / en iyi hamle sık değişiyorsa daha çok düşün,
+        // en iyi hamle aramanın çoğunu alıyorsa (açık ara en iyi) daha az
         if (limits.use_time() && !Threads.stop) {
-            double fallingEval = (69 + 12 * (bestPreviousAverageScore - bestValue) + 6 * (iterValue[iterIdx] - bestValue)) / 781.4;
-            fallingEval = std::clamp(fallingEval, 0.5, 1.5);
-            timeReduction = lastBestMoveDepth + 10 < completedDepth ? 1.63 : 0.73;
-            const double reduction = (1.56 + previousTimeReduction) / (2.20 * timeReduction);
-            // Tüm iş parçacıklarının en iyi hamle değişimlerini topla
-            totBestMoveChanges += Threads.take_best_move_changes();
-            const double instability = 1 + 1.7 * totBestMoveChanges / double(Threads.size());
-            double totalTime = double(Time.optimum()) * fallingEval * reduction * instability;
+            const uint64_t nodesEffort = rootMoves[0].effort * 100000 / std::max<uint64_t>(1, nodes.load());
+
+            double fallingEval = (11.48 + 2.30 * (bestPreviousAverageScore - bestValue)
+                                  + 1.1 * (iterValue[iterIdx] - bestValue))
+                               / 100.0;
+            fallingEval = std::clamp(fallingEval, 0.576, 1.728);
+
+            timeReduction =
+                std::clamp(interpolate(double(rootDepth - lastBestMoveDepth), 4.96, 18.79, 0.639, 1.712), 0.629, 1.544);
+            const double reduction = (1.468 + previousTimeReduction) / (2.284 * timeReduction);
+            const double bestMoveInstability = 1.077 + 2.229 * totBestMoveChanges / double(Threads.size());
+            const double highBestMoveEffort =
+                std::clamp(interpolate(int64_t(nodesEffort), int64_t(75800), int64_t(104510), 0.969, 0.714), 0.693, 0.838);
+
+            double totalTime = double(Time.optimum()) * fallingEval * reduction * bestMoveInstability * highBestMoveEffort;
             if (rootMoves.size() == 1) totalTime = std::min(500.0, totalTime);
 
             const TimePoint el = Time.elapsed();
-            if (el > totalTime) Threads.stop = true;
-            else Threads.increaseDepth = el <= totalTime * 0.53;
+            if (el > std::min(totalTime, double(Time.maximum())) || rootMoves[0].score >= mate_in(3)
+                || rootMoves[0].score == mated_in(2))
+                Threads.stop = true;
+            else
+                Threads.increaseDepth = el <= totalTime * 0.50;
         }
         iterValue[iterIdx] = bestValue;
         iterIdx = (iterIdx + 1) & 3;
     }
     if (is_main()) previousTimeReduction = timeReduction;
+}
+
+// ---------------------------------------------------------------------------
+//  Yardımcılar
+// ---------------------------------------------------------------------------
+Value Thread::evaluate(const Position& pos) {
+    return Eval::evaluate(pos, evaluator, optimism[pos.side_to_move()]);
+}
+
+int Thread::reduction(bool improving, Depth d, int mn, int delta) const {
+    const int reductionScale = reductions[d] * reductions[mn];
+    return reductionScale - delta * 577 / rootDelta + !improving * reductionScale * 197 / 512 + 982;
+}
+
+// Statik değerlendirmeye eklenecek düzeltme (1/131072 ölçeğinde)
+int Thread::correction_value(const Position& pos, const Search::Stack* ss) {
+    const Color us = pos.side_to_move();
+    const Move m = (ss - 1)->currentMove;
+    const int pcv = correctionHistory.entry(pos.pawn_key())[us].pawn;
+    const int micv = correctionHistory.entry(pos.minor_piece_key())[us].minor;
+    const int wnpcv = correctionHistory.entry(pos.non_pawn_key(WHITE))[us].nonPawnWhite;
+    const int bnpcv = correctionHistory.entry(pos.non_pawn_key(BLACK))[us].nonPawnBlack;
+    const Piece pc = m.is_ok() ? pos.piece_on(m.to_sq()) : NO_PIECE;
+    const int cntcv = m.is_ok() ? 7885
+                                      * ((*(ss - 2)->continuationCorrectionHistory)(pc, m.to_sq())
+                                         + (*(ss - 4)->continuationCorrectionHistory)(pc, m.to_sq()))
+                                  + 6307 * (*(ss - 6)->continuationCorrectionHistory)(pc, m.to_sq())
+                                : 80695;
+    return 13806 * pcv + 9512 * micv + 11615 * (wnpcv + bnpcv) + cntcv;
+}
+
+void Thread::update_correction_history(const Position& pos, Search::Stack* ss, int bonus) {
+    const Move m = (ss - 1)->currentMove;
+    const Color us = pos.side_to_move();
+    constexpr int nonPawnWeight = 186;
+
+    correctionHistory.entry(pos.pawn_key())[us].pawn << bonus;
+    correctionHistory.entry(pos.minor_piece_key())[us].minor << bonus * 150 / 128;
+    correctionHistory.entry(pos.non_pawn_key(WHITE))[us].nonPawnWhite << bonus * nonPawnWeight / 128;
+    correctionHistory.entry(pos.non_pawn_key(BLACK))[us].nonPawnBlack << bonus * nonPawnWeight / 128;
+
+    if (m.is_ok()) {
+        const Square to = m.to_sq();
+        const Piece pc = pos.piece_on(to);
+        (*(ss - 2)->continuationCorrectionHistory)(pc, to) << bonus * 130 / 128;
+        (*(ss - 4)->continuationCorrectionHistory)(pc, to) << bonus * 70 / 128;
+        (*(ss - 6)->continuationCorrectionHistory)(pc, to) << bonus * 35 / 128;
+    }
+}
+
+void Thread::do_move(Position& pos, Move m, Search::Stack* ss) {
+    const bool capture = pos.capture_stage(m);
+    const Piece pc = pos.moved_piece(m);
+    nodes.store(nodes.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    pos.do_move(m);
+    ss->currentMove = m;
+    ss->continuationHistory = &continuationHistory[ss->inCheck][capture](pc, m.to_sq());
+    ss->continuationCorrectionHistory = &continuationCorrectionHistory(pc, m.to_sq());
+}
+
+void Thread::do_null_move(Position& pos, Search::Stack* ss) {
+    pos.do_null_move();
+    ss->currentMove = Move::null();
+    ss->continuationHistory = &continuationHistory[0][0](NO_PIECE, SQ_A1);
+    ss->continuationCorrectionHistory = &continuationCorrectionHistory(NO_PIECE, SQ_A1);
 }
 
 // ---------------------------------------------------------------------------
@@ -456,188 +624,243 @@ Value Thread::search(Position& pos, Search::Stack* ss, Value alpha, Value beta, 
     using namespace Search;
     constexpr bool PvNode = NT != NonPV;
     constexpr bool rootNode = NT == Root;
+    const bool allNode = !(PvNode || cutNode);
+    // Mat arama modu: kök skoru derinliğe göre düşen bir eşiği geçtiyse (ayar değil, ayarlanmaz)
+    const bool seekMate = std::abs(rootMoves[pvIdx].score) >= 750 + 220000 / (rootDepth * rootDepth);
 
     if (depth <= 0) return qsearch<PvNode ? PV : NonPV>(pos, ss, alpha, beta);
 
+    // Uzatmalar derinliği fazla büyüttüyse sınırla
+    depth = std::min(depth, MAX_PLY - 1);
+
+    // Tek hamlede tekrar çekilebiliyorsa beraberlik alt sınırdır
+    if (!rootNode && alpha < VALUE_DRAW && pos.upcoming_repetition(ss->ply)) {
+        alpha = value_draw(nodes.load(std::memory_order_relaxed));
+        if (alpha >= beta) return alpha;
+    }
+
     assert(-VALUE_INFINITE <= alpha && alpha < beta && beta <= VALUE_INFINITE);
     assert(PvNode || (alpha == beta - 1));
+    assert(!(PvNode && cutNode));
 
-    Move pv[MAX_PLY + 1], capturesSearched[32], quietsSearched[64];
-    Value bestValue, value, ttValue, eval, maxValue = VALUE_INFINITE, probCutBeta;
-    Move ttMove, move, excludedMove, bestMove;
+    Move pv[MAX_PLY + 1], capturesSearched[SEARCHEDLIST_CAPACITY], quietsSearched[SEARCHEDLIST_CAPACITY];
+    int captureCount = 0, quietCount = 0;
+    Move move, excludedMove, bestMove;
     Depth extension, newDepth;
-    bool givesCheck, improving, priorCapture, singularQuietLMR, capture, moveCountPruning, ttCapture;
-    int moveCount = 0, captureCount = 0, quietCount = 0, improvement;
+    Value bestValue, value, eval, maxValue, probCutBeta;
+    bool givesCheck, improving, priorCapture, opponentWorsening, capture, ttCapture;
+    int priorReduction;
     Piece movedPiece;
 
-    const Color us = pos.side_to_move();
+    // 1. Düğümü hazırla
     ss->inCheck = pos.checkers();
     priorCapture = pos.captured_piece();
+    const Color us = pos.side_to_move();
+    ss->moveCount = 0;
     bestValue = -VALUE_INFINITE;
+    maxValue = VALUE_INFINITE;
+
+    ss->followPV = rootNode
+                || ((ss - 1)->followPV && size_t(ss->ply - 1) < lastIterationIdxPV.size()
+                    && (ss - 1)->currentMove == lastIterationIdxPV[ss->ply - 1]);
 
     if (is_main()) check_time();
     if (PvNode && selDepth < ss->ply + 1) selDepth = ss->ply + 1;
 
     if (!rootNode) {
-        // Durma, beraberlik, en derin ply
+        // 2. Durma, beraberlik, en derin ply
         if (Threads.stop.load(std::memory_order_relaxed) || pos.is_draw(ss->ply) || ss->ply >= MAX_PLY)
-            return (ss->ply >= MAX_PLY && !ss->inCheck) ? Eval::evaluate(pos, evaluator) : value_draw(this);
+            return (ss->ply >= MAX_PLY && !ss->inCheck) ? evaluate(pos) : value_draw(nodes.load(std::memory_order_relaxed));
 
-        // Mat mesafesi budaması: daha kısa bir mat zaten bulunduysa bu dal onu geçemez
+        // 3. Mat mesafesi budaması: daha kısa bir mat zaten bulunduysa bu dal onu geçemez
         alpha = std::max(mated_in(ss->ply), alpha);
         beta = std::min(mate_in(ss->ply + 1), beta);
         if (alpha >= beta) return alpha;
-    } else
-        rootDelta = std::max(1, beta - alpha);
+    }
 
-    (ss + 1)->ttPv = false;
-    (ss + 1)->excludedMove = bestMove = Move::none();
-    (ss + 2)->killers[0] = (ss + 2)->killers[1] = Move::none();
-    (ss + 2)->cutoffCnt = 0;
-    ss->doubleExtensions = (ss - 1)->doubleExtensions;
     const Square prevSq = (ss - 1)->currentMove.is_ok() ? (ss - 1)->currentMove.to_sq() : SQ_NONE;
+    bestMove = Move::none();
+    priorReduction = (ss - 1)->reduction;
+    (ss - 1)->reduction = 0;
     ss->statScore = 0;
+    (ss + 2)->cutoffCnt = 0;
+    (ss + 1)->priorNMPFailHigh = 0;
 
-    // --- TT ---
+    const int correctionValue = correction_value(pos, ss);
+
+    // 4. TT
     excludedMove = ss->excludedMove;
-    // Tekillik araması (bir hamle hariç) ayrı anahtar kullanır
-    const Key posKey = excludedMove ? pos.key() ^ (Key(excludedMove.raw()) * 0x9E3779B97F4A7C15ULL) : pos.key();
+    const Key posKey = pos.key();
     bool ttHit;
-    TTEntry* tte = TT.probe(posKey, ttHit);
+    TTData ttData;
+    TTEntry* tte = TT.probe(posKey, ttHit, ttData);
     ss->ttHit = ttHit;
-    ttValue = ttHit ? value_from_tt(tte->value(), ss->ply, pos.rule50()) : VALUE_NONE;
-    ttMove = rootNode ? rootMoves[pvIdx].pv[0] : ttHit ? tte->move() : Move::none();
-    ttCapture = ttMove && pos.capture_stage(ttMove);
-    if (!excludedMove) ss->ttPv = PvNode || (ttHit && tte->is_pv());
+    ttData.move = rootNode ? rootMoves[pvIdx].pv[0] : ttHit ? ttData.move : Move::none();
+    ttData.value = ttHit ? value_from_tt(ttData.value, ss->ply, pos.rule50()) : VALUE_NONE;
+    ss->ttPv = excludedMove ? ss->ttPv : PvNode || (ttHit && ttData.isPv);
+    ttCapture = ttData.move && pos.capture_stage(ttData.move);
 
-    // TT kesmesi (PV olmayan düğümde, yeterince derin kayıt)
-    if (!PvNode && ttHit && tte->depth() > depth - (tte->bound() == BOUND_EXACT) && ttValue != VALUE_NONE
-        && (tte->bound() & (ttValue >= beta ? BOUND_LOWER : BOUND_UPPER))) {
-        if (ttMove && pos.legal_move(ttMove)) {
-            if (ttValue >= beta) {
-                if (!ttCapture) update_quiet_stats(pos, ss, ttMove, stat_bonus(depth));
-                // Önceki ply'ın erken sessiz hamlesine ceza
-                if (prevSq != SQ_NONE && (ss - 1)->moveCount <= 2 && !priorCapture)
-                    update_continuation_histories(ss - 1, pos.piece_on(prevSq), prevSq, -stat_bonus(depth + 1));
-            } else if (!ttCapture) {
-                mainHistory(us, ttMove) << -stat_bonus(depth);
-                update_continuation_histories(ss, pos.moved_piece(ttMove), ttMove.to_sq(), -stat_bonus(depth));
+    // 5. Statik değerlendirme (correction history ile düzeltilmiş)
+    Value unadjustedStaticEval = VALUE_NONE;
+    if (ss->inCheck)
+        ss->staticEval = eval = (ss - 2)->staticEval;
+    else if (excludedMove)
+        unadjustedStaticEval = eval = ss->staticEval;
+    else if (ss->ttHit) {
+        unadjustedStaticEval = ttData.eval;
+        if (!is_valid(unadjustedStaticEval)) unadjustedStaticEval = evaluate(pos);
+        ss->staticEval = eval = to_corrected_static_eval(unadjustedStaticEval, correctionValue);
+        // TT değeri daha iyi bir tahmin olabilir
+        if (is_valid(ttData.value) && (ttData.bound & (ttData.value > eval ? BOUND_LOWER : BOUND_UPPER)))
+            eval = ttData.value;
+    } else {
+        unadjustedStaticEval = evaluate(pos);
+        ss->staticEval = eval = to_corrected_static_eval(unadjustedStaticEval, correctionValue);
+        // TT'ye düzeltilmemiş değer yazılır
+        tte->save(posKey, VALUE_NONE, ss->ttPv, BOUND_NONE, DEPTH_UNSEARCHED, Move::none(), unadjustedStaticEval);
+    }
+
+    // Değerlendirme bizim için iki ply öncesinden iyi mi? Rakip için önceki plydan kötü mü?
+    improving = ss->staticEval > (ss - 2)->staticEval;
+    opponentWorsening = ss->staticEval > -(ss - 1)->staticEval;
+
+    // Önceki indirgemeyi değerlendirme farkına göre geriye dönük düzelt
+    if (priorReduction >= 3 && !opponentWorsening) depth++;
+    if (priorReduction >= 2 && depth >= 2 && ss->staticEval + (ss - 1)->staticEval > 166) depth--;
+
+    // 6. TT kesmesi (PV olmayan düğümde, yeterince derin kayıt)
+    if (!PvNode && !excludedMove && is_valid(ttData.value) && ttData.depth > depth - (ttData.value <= beta)) {
+        // Kayıt kesme yapabiliyor
+        if ((ttData.bound & (ttData.value >= beta ? BOUND_LOWER : BOUND_UPPER))
+            && (cutNode == (ttData.value >= beta) || depth > 4)) {
+            if (ttData.move && ttData.value >= beta) {
+                // Beta'yı geçen sessiz TT hamlesine bonus
+                if (!ttCapture) update_quiet_histories(pos, ss, ttData.move, 131 * depth);
+                // Önceki ply'ın erken sessiz hamlesine ek ceza
+                if (prevSq != SQ_NONE && (ss - 1)->moveCount < 5 && !priorCapture)
+                    update_continuation_histories(ss - 1, pos.piece_on(prevSq), prevSq, -2210);
+            }
+
+            // 50 hamle sayacı yüksekse kesme yapma (graph history interaction)
+            if (pos.rule50() < 96) {
+                if (depth >= 7 && ttData.move && pos.legal_move(ttData.move) && !is_decisive(ttData.value)) {
+                    // TT hamlesinden sonraki kayıt da aynı kesmeyi destekliyor mu?
+                    pos.do_move(ttData.move);
+                    bool hitNext;
+                    TTData dataNext;
+                    TT.probe(pos.key(), hitNext, dataNext);
+                    pos.undo_move(ttData.move);
+                    if (!is_valid(dataNext.value)) return ttData.value;
+                    if ((ttData.value >= beta) == (-dataNext.value >= beta)) return ttData.value;
+                } else
+                    return ttData.value;
             }
         }
-        if (pos.rule50() < 90) return ttValue;
+        // Derinlik yetiyordu ama sınır yönü uymadı: kayıt artık işe yaramıyor
+        else if (ttData.bound != BOUND_EXACT && (ttData.bound & (ttData.value >= beta ? BOUND_UPPER : BOUND_LOWER))
+                 && depth > 5)
+            tte->penalize(1);
     }
 
-    // --- Statik değerlendirme ---
-    if (ss->inCheck) {
-        ss->staticEval = eval = VALUE_NONE;
-        improving = false;
-        improvement = 0;
-        goto moves_loop;
-    } else if (excludedMove) {
-        eval = ss->staticEval;  // tekillik aramasında aynı düğüm
-    } else if (ttHit) {
-        ss->staticEval = eval = tte->eval();
-        if (eval == VALUE_NONE) ss->staticEval = eval = Eval::evaluate(pos, evaluator);
-        // TT değeri daha iyi bir tahmin olabilir
-        if (ttValue != VALUE_NONE && (tte->bound() & (ttValue > eval ? BOUND_LOWER : BOUND_UPPER))) eval = ttValue;
-    } else {
-        ss->staticEval = eval = Eval::evaluate(pos, evaluator);
-        tte->save(posKey, VALUE_NONE, ss->ttPv, BOUND_NONE, DEPTH_NONE, Move::none(), eval);
-    }
+    if (ss->inCheck) goto moves_loop;
 
-    // Önceki sessiz hamle pozisyonu iyileştirdi/kötüleştirdi mi? history'ye yansıt
+    // Statik değerlendirme farkıyla önceki sessiz hamlenin sıralamasını düzelt
     if ((ss - 1)->currentMove.is_ok() && !(ss - 1)->inCheck && !priorCapture) {
-        int bonus = std::clamp(-19 * int((ss - 1)->staticEval + ss->staticEval), -1914, 1914);
-        mainHistory(~us, (ss - 1)->currentMove) << bonus;
+        const int evalDiff = std::clamp(-int((ss - 1)->staticEval + ss->staticEval), -189, 194) + 60;
+        mainHistory(~us, (ss - 1)->currentMove) << evalDiff * 11;
+        if (!ttHit && type_of(pos.piece_on(prevSq)) != PAWN && (ss - 1)->currentMove.type_of() != PROMOTION)
+            pawnHistory[pos](pos.piece_on(prevSq), prevSq) << evalDiff * 13;
     }
 
-    improvement = (ss - 2)->staticEval != VALUE_NONE ? ss->staticEval - (ss - 2)->staticEval
-                : (ss - 4)->staticEval != VALUE_NONE ? ss->staticEval - (ss - 4)->staticEval
-                                                     : 168;
-    improving = improvement > 0;
+    // 8. Razoring: çok kötüyse direkt qsearch
+    if (allNode && eval < alpha - 342 * depth && !seekMate) return qsearch<NonPV>(pos, ss, alpha, beta);
 
-    // --- Razoring: çok kötüyse direkt qsearch ---
-    if (eval < alpha - 369 - 254 * depth * depth) {
-        value = qsearch<NonPV>(pos, ss, alpha - 1, alpha);
-        if (value < alpha) return value;
+    // 9. Reverse futility: çok iyiyse keser
+    if (!ss->ttPv && depth < (seekMate ? 6 : 19) && eval >= beta && (!ttData.move || ttCapture) && !is_loss(beta)
+        && !is_win(eval)) {
+        int futilityMult = std::min(45 + depth * 4, 85);
+        futilityMult -= 20 * !ss->ttHit;
+        const int futilityMargin = futilityMult * depth
+                                 - (2789 * improving + 335 * opponentWorsening) * futilityMult / 1024
+                                 + std::abs(correctionValue) / 198435;
+        if (eval - futilityMargin >= beta) return (661 * beta + 363 * eval) / 1024;
     }
 
-    // --- Reverse futility: çok iyiyse keser ---
-    if (!ss->ttPv && depth < 8 && eval - futility_margin(depth, improving) - (ss - 1)->statScore / 303 >= beta
-        && eval >= beta && eval < 28031)
-        return eval;
-
-    // --- Null move ---
-    if (!PvNode && (ss - 1)->currentMove != Move::null() && (ss - 1)->statScore < 17139 && eval >= beta
-        && eval >= ss->staticEval && ss->staticEval >= beta - 20 * depth - improvement / 13 + 233 && !excludedMove
-        && pos.non_pawn_material(us) && (ss->ply >= nmpMinPly || us != nmpColor)) {
-        const Depth R = std::min(int(eval - beta) / 168, 7) + depth / 3 + 4;
-
-        ss->currentMove = Move::null();
-        ss->continuationHistory = &continuationHistory[0][0](NO_PIECE, SQ_A1);
-        pos.do_null_move();
-        Value nullValue = -search<NonPV>(pos, ss + 1, -beta, -beta + 1, depth - R, !cutNode);
+    // 10. Null move (derinde doğrulama araması ile). Aynı ply'da önceki null move'lar
+    // tuttuysa koşul gevşer.
+    if (cutNode && ss->staticEval + 50 * ss->priorNMPFailHigh >= beta - 13 * depth - 47 * improving + 365
+        && !excludedMove && pos.non_pawn_material(us) && ss->ply >= nmpMinPly && beta >= -2000) {
+        const Depth R = 7 + depth / 3 + std::max((ss->staticEval - beta) / 256, 0);
+        do_null_move(pos, ss);
+        Value nullValue = -search<NonPV>(pos, ss + 1, -beta, -beta + 1, depth - R, false);
         pos.undo_null_move();
 
-        if (nullValue >= beta) {
-            if (nullValue >= VALUE_TB_WIN_IN_MAX_PLY) nullValue = beta;  // doğrulanmamış mat skoru döndürme
-            if (nmpMinPly || (std::abs(beta) < VALUE_KNOWN_WIN && depth < 14)) return nullValue;
+        // Doğrulanmamış mat skoru döndürme
+        if (nullValue >= beta && !is_win(nullValue)) {
+            if (nmpMinPly || depth < 16) {
+                ++ss->priorNMPFailHigh;
+                return nullValue;
+            }
 
-            // Derin düğümde zugzwang'a karşı doğrulama araması
+            // Derin düğümde zugzwang'a karşı doğrulama: nmpMinPly'a kadar null move yok
             nmpMinPly = ss->ply + 3 * (depth - R) / 4;
-            nmpColor = us;
             Value v = search<NonPV>(pos, ss, beta - 1, beta, depth - R, false);
             nmpMinPly = 0;
-            if (v >= beta) return nullValue;
-        }
-    }
-
-    probCutBeta = beta + 180 - 54 * improving;
-
-    // --- ProbCut: iyi bir alış sığ aramada beta'yı rahatça geçiyorsa kes ---
-    if (!PvNode && depth > 4 && std::abs(beta) < VALUE_TB_WIN_IN_MAX_PLY
-        && !(ttHit && tte->depth() >= depth - 3 && ttValue != VALUE_NONE && ttValue < probCutBeta)) {
-        MovePicker mp(pos, ttMove, probCutBeta - ss->staticEval, &captureHistory);
-        while ((move = mp.next_move())) {
-            if (move == excludedMove) continue;
-            ss->currentMove = move;
-            ss->continuationHistory = &continuationHistory[ss->inCheck][true](pos.moved_piece(move), move.to_sq());
-            nodes.store(nodes.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-            pos.do_move(move);
-            value = -qsearch<NonPV>(pos, ss + 1, -probCutBeta, -probCutBeta + 1);
-            if (value >= probCutBeta)
-                value = -search<NonPV>(pos, ss + 1, -probCutBeta, -probCutBeta + 1, depth - 4, !cutNode);
-            pos.undo_move(move);
-            if (value >= probCutBeta) {
-                tte->save(posKey, value_to_tt(value, ss->ply), ss->ttPv, BOUND_LOWER, depth - 3, move, ss->staticEval);
-                return value;
+            if (v >= beta) {
+                ++ss->priorNMPFailHigh;
+                return nullValue;
             }
         }
     }
 
-    // --- Internal iterative reduction: TT hamlesi yoksa sığ ara ---
-    if (PvNode && !ttMove) depth -= 3;
-    if (depth <= 0) return qsearch<PV>(pos, ss, alpha, beta);
-    if (cutNode && depth >= 9 && !ttMove) depth -= 2;
+    improving |= ss->staticEval >= beta;
+
+    // 11. Internal iterative reduction: TT hamlesi olmayan PV/cut düğümünü biraz sığ ara
+    if (!ss->followPV && !allNode && depth >= 6 && !ttData.move) depth--;
+
+    // 12. ProbCut: iyi bir alış sığ aramada beta'yı rahatça geçiyorsa kes
+    probCutBeta = beta + 241 - 64 * improving;
+    if (depth >= 3 && !is_decisive(beta) && !(is_valid(ttData.value) && ttData.value < probCutBeta)) {
+        MovePicker mp(pos, ttData.move, probCutBeta - ss->staticEval, &captureHistory);
+        const Depth probCutDepth = depth - (improving ? 5 : 3);
+
+        while ((move = mp.next_move())) {
+            if (move == excludedMove) continue;
+
+            do_move(pos, move, ss);
+            // Önce qsearch ile hamlenin tuttuğunu doğrula
+            value = -qsearch<NonPV>(pos, ss + 1, -probCutBeta, -probCutBeta + 1);
+            if (value >= probCutBeta && probCutDepth > 0)
+                value = -search<NonPV>(pos, ss + 1, -probCutBeta, -probCutBeta + 1, probCutDepth, !cutNode);
+            undo_move(pos, move);
+
+            if (value >= probCutBeta) {
+                tte->save(posKey, value_to_tt(value, ss->ply), ss->ttPv, BOUND_LOWER, probCutDepth + 1, move,
+                          unadjustedStaticEval);
+                if (!is_decisive(value)) return value - (probCutBeta - beta);
+            }
+        }
+    }
 
 moves_loop:
-    // Şahtayken küçük ProbCut: TT'deki alış zaten çok iyi
-    probCutBeta = beta + 481;
-    if (ss->inCheck && !PvNode && depth >= 2 && ttCapture && (tte->bound() & BOUND_LOWER) && tte->depth() >= depth - 3
-        && ttValue >= probCutBeta && std::abs(ttValue) <= VALUE_KNOWN_WIN && std::abs(beta) <= VALUE_KNOWN_WIN)
+    // 13. Küçük ProbCut: TT'deki alt sınır zaten çok yüksek
+    probCutBeta = beta + 428;
+    if ((ttData.bound & BOUND_LOWER) && ttData.depth >= depth - 4 && is_valid(ttData.value)
+        && ttData.value >= probCutBeta && !is_decisive(beta) && !is_decisive(ttData.value))
         return probCutBeta;
 
-    const PieceToHistory* contHist[] = {(ss - 1)->continuationHistory, (ss - 2)->continuationHistory, nullptr,
-                                        (ss - 4)->continuationHistory, nullptr, (ss - 6)->continuationHistory};
-    const Move countermove = prevSq != SQ_NONE ? counterMoves(pos.piece_on(prevSq), prevSq) : Move::none();
+    const PieceToHistory* contHist[] = {(ss - 1)->continuationHistory, (ss - 2)->continuationHistory,
+                                        (ss - 3)->continuationHistory, (ss - 4)->continuationHistory,
+                                        (ss - 5)->continuationHistory, (ss - 6)->continuationHistory};
 
-    MovePicker mp(pos, ttMove, depth, &mainHistory, &captureHistory, contHist, countermove, ss->killers);
+    MovePicker mp(pos, ttData.move, depth, &mainHistory, &lowPlyHistory, &captureHistory, contHist, &pawnHistory,
+                  ss->ply);
 
     value = bestValue;
-    moveCountPruning = singularQuietLMR = false;
-    const bool likelyFailLow = PvNode && ttMove && (tte->bound() & BOUND_UPPER) && tte->depth() >= depth;
+    int moveCount = 0;
 
-    while ((move = mp.next_move(moveCountPruning))) {
+    // 14. Hamle döngüsü
+    while ((move = mp.next_move())) {
         if (move == excludedMove) continue;
         if (rootNode && !std::count(rootMoves.begin() + pvIdx, rootMoves.begin() + pvLast, move)) continue;
 
@@ -649,187 +872,299 @@ moves_loop:
         movedPiece = pos.moved_piece(move);
         givesCheck = pos.gives_check(move);
         newDepth = depth - 1;
-        const Value delta = beta - alpha;
 
-        // --- Sığ derinlikte budama ---
-        if (!rootNode && pos.non_pawn_material(us) && bestValue > VALUE_TB_LOSS_IN_MAX_PLY) {
-            moveCountPruning = moveCount >= futility_move_count(improving, depth);
-            const int lmrDepth = std::max(newDepth - reduction(improving, depth, moveCount, delta, rootDelta), 0);
+        const int delta = beta - alpha;
+        int r = reduction(improving, depth, moveCount, delta);
+
+        // TT PV düğümlerinde indirgemeyi artır (aşağıda geri alınır)
+        if (ss->ttPv) r += 929;
+
+        // 15. Sığ derinlikte budama
+        if (!rootNode && pos.non_pawn_material(us) && !is_loss(bestValue)) {
+            // Hamle sayısı eşiği aşıldıysa sessiz hamleleri atla
+            if (moveCount >= (3 + depth * depth) / (2 - improving)) mp.skip_quiet_moves();
+
+            int lmrDepth = newDepth - r / 1024;
 
             if (capture || givesCheck) {
-                const Piece captured = move.type_of() == EN_PASSANT ? make_piece(~us, PAWN) : pos.piece_on(move.to_sq());
+                const Piece capturedPiece = pos.piece_on(move.to_sq());
+                const int captHist = captureHistory(movedPiece, move.to_sq(), type_of(capturedPiece));
+
                 // Alışlarda futility
-                if (!givesCheck && !PvNode && lmrDepth < 7 && !ss->inCheck
-                    && ss->staticEval + 185 + 203 * lmrDepth + PieceValueEg[captured]
-                               + captureHistory(movedPiece, move.to_sq(), type_of(captured)) / 6
-                           < alpha)
+                if (!givesCheck && lmrDepth < 8) {
+                    const Value futilityValue = ss->staticEval + 234 + 247 * lmrDepth + PieceValue[capturedPiece]
+                                              + 134 * captHist / 1024;
+                    if (futilityValue <= alpha) continue;
+                }
+
+                // SEE budaması (son taşımızı pat için feda etmeyi budama)
+                const int margin = 177 * depth + captHist * 34 / 1024;
+                if ((alpha >= VALUE_DRAW || pos.non_pawn_material(us) != PieceValue[movedPiece])
+                    && !pos.see_ge(move, -margin))
                     continue;
-                // SEE budaması (şah çeken hamleler dahil — SEE şah kuralını biliyor)
-                if (!pos.see_ge(move, -220 * depth)) continue;
-            } else {
+            } else if (!ss->followPV || !PvNode) {
                 int history = (*contHist[0])(movedPiece, move.to_sq()) + (*contHist[1])(movedPiece, move.to_sq())
-                            + (*contHist[3])(movedPiece, move.to_sq());
+                            + pawnHistory[pos](movedPiece, move.to_sq());
+
                 // Continuation history budaması
-                if (lmrDepth < 5 && history < -3875 * (depth - 1)) continue;
-                history += 2 * mainHistory(us, move);
+                if (history < -4136 * depth) continue;
+
+                history += 69 * mainHistory(us, move) / 32;
+                lmrDepth += history / lmr_divisor(depth);
+
+                const Value futilityValue = ss->staticEval + 119 * lmrDepth + 90 * (ss->staticEval > alpha) + 164;
+
                 // Sessiz hamlelerde futility
-                if (!ss->inCheck && lmrDepth < 13 && ss->staticEval + 106 + 145 * lmrDepth + history / 52 <= alpha)
+                if (!ss->inCheck && lmrDepth < 12 && futilityValue <= alpha) {
+                    if (bestValue <= futilityValue && !is_decisive(bestValue) && !is_win(futilityValue))
+                        bestValue = futilityValue;
                     continue;
+                }
+
+                lmrDepth = std::max(lmrDepth, 0);
+
                 // SEE budaması
-                if (!pos.see_ge(move, -24 * lmrDepth * lmrDepth - 15 * lmrDepth)) continue;
+                if (!pos.see_ge(move, -23 * lmrDepth * lmrDepth)) continue;
             }
         }
 
-        // --- Uzatmalar ---
-        if (ss->ply < rootDepth * 2) {
-            // Tekil uzatma: TT hamlesi diğer tüm hamlelerden belirgin iyiyse onu derin ara
-            if (!rootNode && depth >= 4 - (completedDepth > 22) + 2 * (PvNode && tte->is_pv()) && move == ttMove
-                && !excludedMove && std::abs(ttValue) < VALUE_KNOWN_WIN && (tte->bound() & BOUND_LOWER)
-                && tte->depth() >= depth - 3) {
-                const Value singularBeta = ttValue - (3 + (ss->ttPv && !PvNode)) * depth;
-                const Depth singularDepth = (depth - 1) / 2;
+        // 16. Tekil uzatma: TT hamlesi diğer tüm hamlelerden belirgin iyiyse onu derin ara
+        if (!rootNode && move == ttData.move && !excludedMove && depth >= 6 + ss->ttPv && is_valid(ttData.value)
+            && !is_decisive(ttData.value) && (ttData.bound & BOUND_LOWER) && ttData.depth >= depth - 3
+            && !is_shuffling(move, ss, pos) && !seekMate) {
+            const Value singularBeta = ttData.value - (59 + 66 * (ss->ttPv && !PvNode)) * depth / 63;
+            const Depth singularDepth = newDepth / 2;
 
-                ss->excludedMove = move;
-                value = search<NonPV>(pos, ss, singularBeta - 1, singularBeta, singularDepth, cutNode);
-                ss->excludedMove = Move::none();
+            ss->excludedMove = move;
+            value = search<NonPV>(pos, ss, singularBeta - 1, singularBeta, singularDepth, cutNode);
+            ss->excludedMove = Move::none();
 
-                if (value < singularBeta) {
-                    extension = 1;
-                    singularQuietLMR = !ttCapture;
-                    if (!PvNode && value < singularBeta - 25 && ss->doubleExtensions <= 9) extension = 2;
+            if (value < singularBeta) {
+                const int corrValAdj = std::abs(correctionValue) / 198368;
+                const int doubleMargin = -2 + 204 * PvNode - 152 * !ttCapture - corrValAdj
+                                       - 1175 * ttMoveHistory / 114178 - (ss->ply > rootDepth) * 38;
+                const int tripleMargin = 70 + 279 * PvNode - 188 * !ttCapture + 81 * ss->ttPv - corrValAdj
+                                       - (ss->ply > rootDepth) * 43;
+                extension = 1 + (value < singularBeta - doubleMargin) + (value < singularBeta - tripleMargin);
+                depth++;
+            }
+            // Çoklu kesme: TT hamlesi olmadan da beta geçiliyor
+            else if (value >= beta && !is_decisive(value)) {
+                ttMoveHistory << -421 - 110 * depth;
+                if (!ss->inCheck && value > ss->staticEval) {
+                    const int bonus = std::clamp(int(value - ss->staticEval) * 664 / 1024,
+                                                 -CORRECTION_HISTORY_LIMIT / 4, CORRECTION_HISTORY_LIMIT / 4);
+                    update_correction_history(pos, ss, bonus);
                 }
-                // Çoklu kesme: TT hamlesi olmadan da beta geçiliyor
-                else if (singularBeta >= beta)
-                    return singularBeta;
-                // Negatif uzatma
-                else if (ttValue >= beta)
-                    extension = -2;
-                else if (ttValue <= alpha)
-                    extension = -1;
-            } else if (givesCheck && depth > 9 && std::abs(ss->staticEval) > 82)
-                extension = 1;
-            else if (PvNode && move == ttMove && move == ss->killers[0]
-                     && (*contHist[0])(movedPiece, move.to_sq()) >= 5177)
-                extension = 1;
+                return value;
+            }
+            // Negatif uzatma
+            else if (ttData.value >= beta || cutNode)
+                extension = -3;
         }
 
+        const uint64_t nodeCount = rootNode ? nodes.load(std::memory_order_relaxed) : 0;
+
+        // 17. Hamleyi yap
+        do_move(pos, move, ss);
         newDepth += extension;
-        ss->doubleExtensions = (ss - 1)->doubleExtensions + (extension == 2);
 
-        ss->currentMove = move;
-        ss->continuationHistory = &continuationHistory[ss->inCheck][capture](movedPiece, move.to_sq());
+        // 18. LMR (indirgeme 1/1024 ölçeğinde)
+        if (ss->ttPv)
+            r -= 3023 + PvNode * 1004 + (ttData.value > alpha) * 885 + (ttData.depth >= depth) * (816 + cutNode * 940);
 
-        nodes.store(nodes.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-        pos.do_move(move);
+        r += 697;
+        r -= moveCount * 65;
+        r -= std::abs(correctionValue) / 26310;
 
-        // --- LMR ---
-        if (depth >= 2 && moveCount > 1 + (PvNode && ss->ply <= 1)
-            && (!ss->ttPv || !capture || (cutNode && (ss - 1)->moveCount > 1))) {
-            Depth r = reduction(improving, depth, moveCount, delta, rootDelta);
+        if (cutNode) r += 4026 + 933 * !ttData.move;
+        if (ttCapture) r += 1079;
+        // Sonraki ply'da çok kesme olduysa
+        if ((ss + 1)->cutoffCnt > 1) r += 264 + 1095 * ((ss + 1)->cutoffCnt > 2) + 1138 * allNode;
+        else if (move == ttData.move) r -= 2179;
 
-            if (ss->ttPv && !likelyFailLow) r -= 2;
-            if ((ss - 1)->moveCount > 7) r--;
-            if (cutNode) r += 2;
-            if (ttCapture) r++;
-            if (PvNode) r -= 1 + 11 / (3 + depth);
-            if (singularQuietLMR) r--;
-            if ((ss + 1)->cutoffCnt > 3 && !PvNode) r++;
+        if (capture)
+            ss->statScore = 873 * int(PieceValue[pos.captured_piece()]) / 128
+                          + captureHistory(movedPiece, move.to_sq(), type_of(pos.captured_piece()));
+        else
+            ss->statScore = (2252 * mainHistory(us, move) + 1126 * (*contHist[0])(movedPiece, move.to_sq())
+                             + 1093 * (*contHist[1])(movedPiece, move.to_sq()))
+                          / 1024;
 
-            ss->statScore = 2 * mainHistory(us, move) + (*contHist[0])(movedPiece, move.to_sq())
-                          + (*contHist[1])(movedPiece, move.to_sq()) + (*contHist[3])(movedPiece, move.to_sq()) - 4433;
-            r -= ss->statScore / (13628 + 4000 * (depth > 7 && depth < 19));
+        // History'si iyi hamleyi daha az, kötüsünü daha çok indirge
+        r -= ss->statScore * 439 / 4096;
 
-            const Depth d = std::clamp(newDepth - r, 1, newDepth + 1);
+        if (!capture && !is_decisive(alpha)) r += 3 * std::clamp(alpha - eval, -64, 96);
+
+        // Beklenen all düğümlerinde indirgemeyi büyüt
+        if (allNode) r += r * 276 / (256 * depth + 268);
+
+        if (depth >= 2 && moveCount > 1) {
+            // Negatif indirgemede sınırlı bir uzatmaya izin ver (ağacın çok derininde değil)
+            const Depth d = std::max(1, newDepth + std::min(-r / 1024, ss->ply < 2 * rootDepth ? 2 : 0)) + PvNode;
+
+            ss->reduction = newDepth - d;
             value = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, d, true);
+            ss->reduction = 0;
 
             // İndirgenmiş arama alpha'yı geçtiyse tam derinlikte tekrar
-            if (value > alpha && d < newDepth) {
-                const bool doDeeperSearch = value > (alpha + 64 + 11 * (newDepth - d));
-                newDepth += doDeeperSearch;
-                value = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, newDepth, !cutNode);
+            if (value > alpha) {
+                const bool doDeeperSearch = d < newDepth && value > bestValue + 53;
+                const bool doShallowerSearch = value < bestValue + 8;
+                newDepth += doDeeperSearch - doShallowerSearch;
 
-                int bonus = value > alpha ? stat_bonus(newDepth) : -stat_bonus(newDepth);
-                if (capture) bonus /= 6;
-                update_continuation_histories(ss, movedPiece, move.to_sq(), bonus);
+                if (newDepth > d) value = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, newDepth, !cutNode);
+
+                update_continuation_histories(ss, movedPiece, move.to_sq(), 1334);
             }
-        } else if (!PvNode || moveCount > 1)
-            value = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, newDepth, !cutNode);
+        }
+        // 19. LMR yoksa tam derinlik (sıfır pencere)
+        else if (!PvNode || moveCount > 1) {
+            if (!ttData.move) r += 1127;
+            value = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha,
+                                   newDepth - (r > 5234) - (r > 5487 && newDepth > 2), !cutNode);
+        }
 
-        // PV düğümünde ilk hamle ya da pencereye düşen hamle: tam pencere
-        if (PvNode && (moveCount == 1 || (value > alpha && (rootNode || value < beta)))) {
+        // 20. PV düğümünde ilk hamle ya da alpha'yı geçen hamle: tam pencere
+        if (PvNode && (moveCount == 1 || value > alpha)) {
             (ss + 1)->pv = pv;
             (ss + 1)->pv[0] = Move::none();
+
+            // qsearch'e dalmak üzereysek TT hamlesini uzat
+            if (move == ttData.move
+                && ((is_valid(ttData.value) && is_decisive(ttData.value) && ttData.depth > 0) || ttData.depth > 1))
+                newDepth = std::max(newDepth, 1);
+
             value = -search<PV>(pos, ss + 1, -beta, -alpha, newDepth, false);
         }
 
-        pos.undo_move(move);
+        // 21. Geri al
+        undo_move(pos, move);
 
+        // 22. Durduysak sonuç güvenilmez
         if (Threads.stop.load(std::memory_order_relaxed)) return VALUE_ZERO;
 
         if (rootNode) {
             RootMove& rm = *std::find(rootMoves.begin(), rootMoves.end(), move);
-            rm.averageScore = rm.averageScore != -VALUE_INFINITE ? (2 * value + rm.averageScore) / 3 : value;
+
+            const uint64_t N = nodes.load(std::memory_order_relaxed) - nodeCount;
+            rm.effort += N;
+            const uint64_t E_prev = std::max<uint64_t>(1, rm.effort - N);
+
+            // Kök hamlesinin skorları için üstel hareketli ortalama (ağırlık aramanın payına göre)
+            constexpr uint64_t Scale = 32, ChiNumerator = 3, ChiDenominator = 2, MinWeight = 12, MaxWeight = 24;
+            const uint64_t w =
+                std::clamp((Scale * N * ChiDenominator) / (N * ChiDenominator + ChiNumerator * E_prev), MinWeight, MaxWeight);
+            const uint64_t w_mss = std::min<uint64_t>(w, 16);
+            const int64_t v2 = int64_t(value) * std::abs(value);
+
+            if (rm.averageScore == -VALUE_INFINITE) rm.averageScore = value;
+            else rm.averageScore = Value((value * int64_t(w) + rm.averageScore * int64_t(Scale - w)) / int64_t(Scale));
+
+            if (rm.meanSquaredScore == -VALUE_INFINITE * VALUE_INFINITE) rm.meanSquaredScore = value * std::abs(value);
+            else
+                rm.meanSquaredScore =
+                    Value((v2 * int64_t(w_mss) + int64_t(rm.meanSquaredScore) * int64_t(Scale - w_mss)) / int64_t(Scale));
+
             if (moveCount == 1 || value > alpha) {
                 rm.score = rm.uciScore = value;
                 rm.selDepth = selDepth;
-                rm.scoreLowerbound = rm.scoreUpperbound = false;
+                rm.unset_inexact();
                 if (value >= beta) {
-                    rm.scoreLowerbound = true;
+                    rm.inexactLower = true;
                     rm.uciScore = beta;
                 } else if (value <= alpha) {
-                    rm.scoreUpperbound = true;
+                    rm.inexactUpper = true;
                     rm.uciScore = alpha;
                 }
                 rm.pv.resize(1);
                 for (Move* m = (ss + 1)->pv; m && *m; ++m) rm.pv.push_back(*m);
                 if (moveCount > 1 && !pvIdx) ++bestMoveChanges;
             } else
-                rm.score = -VALUE_INFINITE;  // sıralamada sona
+                rm.score = -VALUE_INFINITE;  // sıralamada sona (sıralama kararlı)
         }
 
-        if (value > bestValue) {
+        // Eşit değerli alternatifi bazen en iyi hamle yap (çeşitlilik)
+        const int inc = (value == bestValue && ss->ply + 2 >= rootDepth
+                         && (int(nodes.load(std::memory_order_relaxed)) & 14) == 0 && !is_win(std::abs(value) + 1));
+
+        if (value + inc > bestValue) {
             bestValue = value;
-            if (value > alpha) {
+            if (value + inc > alpha) {
                 bestMove = move;
-                if (PvNode && !rootNode) update_pv(ss->pv, move, (ss + 1)->pv);
-                if (PvNode && value < beta) {
-                    alpha = value;
-                    // Kalan hamleleri biraz daha sığ ara
-                    if (depth > 1 && depth < 6 && beta < VALUE_KNOWN_WIN && alpha > -VALUE_KNOWN_WIN) depth -= 1;
-                } else {
-                    ss->cutoffCnt++;
+                if (PvNode && !rootNode) update_pv(ss->pv, move, (ss + 1)->pv);  // fail high'da da
+
+                if (value >= beta) {
+                    ss->cutoffCnt += (extension < 2) || PvNode;
                     break;  // beta kesmesi
                 }
+
+                // Bir iyileşme bulduysak kalan hamleleri daha sığ ara
+                if (depth > 3 && depth < 12 && !is_decisive(value)) depth -= 3;
+
+                alpha = value;
             }
         }
 
-        if (move != bestMove) {
-            if (capture && captureCount < 32) capturesSearched[captureCount++] = move;
-            else if (!capture && quietCount < 64) quietsSearched[quietCount++] = move;
+        // En iyi olmayan hamleleri sonra istatistik için hatırla
+        if (move != bestMove && moveCount <= SEARCHEDLIST_CAPACITY) {
+            if (capture) capturesSearched[captureCount++] = move;
+            else quietsSearched[quietCount++] = move;
         }
     }
 
-    // Hiç legal hamle yoksa mat ya da pat
+    // 23. Mat / pat, istatistikler
+    // Fail high'da değeri beta'ya doğru yumuşat
+    if (bestValue >= beta && !is_decisive(bestValue) && !is_decisive(alpha))
+        bestValue = (bestValue * depth + beta) / (depth + 1);
+
     if (!moveCount)
         bestValue = excludedMove ? alpha : ss->inCheck ? mated_in(ss->ply) : VALUE_DRAW;
-    else if (bestMove)
-        update_all_stats(pos, ss, bestMove, bestValue, beta, prevSq, quietsSearched, quietCount, capturesSearched,
-                         captureCount, depth);
-    // Alpha geçilemediyse: bu düğüme yol açan hamle iyi bir cevaptı
-    else if ((depth >= 5 || PvNode) && !priorCapture && prevSq != SQ_NONE)
-        update_continuation_histories(ss - 1, pos.piece_on(prevSq), prevSq,
-                                      stat_bonus(depth) * (1 + (PvNode || cutNode)));
+    else if (bestMove) {
+        update_all_stats(pos, ss, bestMove, prevSq, quietsSearched, quietCount, capturesSearched, captureCount, depth,
+                         ttData.move, PvNode);
+        if (!PvNode) ttMoveHistory << (bestMove == ttData.move ? 918 : -747);
+    }
+    // Alpha geçilemedi: bu düğüme yol açan sessiz hamle iyi bir cevaptı
+    else if (!priorCapture && prevSq != SQ_NONE) {
+        int bonusScale = -241;
+        bonusScale -= (ss - 1)->statScore / 98;
+        bonusScale += std::min(59 * depth, 420);
+        bonusScale += 186 * ((ss - 1)->moveCount > 9);
+        bonusScale += 142 * (!ss->inCheck && bestValue <= ss->staticEval - 106);
+        bonusScale += 159 * (!(ss - 1)->inCheck && bestValue <= -(ss - 1)->staticEval - 68);
+        bonusScale = std::max(bonusScale, 0);
+
+        const int scaledBonus = std::min(150 * depth - 85, 1337) * bonusScale;
+
+        update_continuation_histories(ss - 1, pos.piece_on(prevSq), prevSq, scaledBonus * 263 / 16384);
+        mainHistory(~us, (ss - 1)->currentMove) << scaledBonus * 215 / 32768;
+        if (type_of(pos.piece_on(prevSq)) != PAWN && (ss - 1)->currentMove.type_of() != PROMOTION)
+            pawnHistory[pos](pos.piece_on(prevSq), prevSq) << scaledBonus * 324 / 8192;
+    }
+    // Alpha geçilemedi ve önceki hamle alıştı: o alışa bonus
+    else if (priorCapture && prevSq != SQ_NONE)
+        captureHistory(pos.piece_on(prevSq), prevSq, type_of(pos.captured_piece())) << 892;
 
     if (PvNode) bestValue = std::min(bestValue, maxValue);
 
-    if (bestValue <= alpha) ss->ttPv = ss->ttPv || ((ss - 1)->ttPv && depth > 3);
+    // İyi hamle yoksa ve önceki pozisyon ttPv idiyse bu pozisyon da PV ağacına girer
+    if (bestValue <= alpha) ss->ttPv = ss->ttPv || (ss - 1)->ttPv;
 
+    // 24. TT'ye yaz (düzeltilmemiş statik değerlendirme ile)
     if (!excludedMove && !(rootNode && pvIdx))
         tte->save(posKey, value_to_tt(bestValue, ss->ply), ss->ttPv,
                   bestValue >= beta    ? BOUND_LOWER
                   : PvNode && bestMove ? BOUND_EXACT
                                        : BOUND_UPPER,
-                  depth, bestMove, ss->staticEval);
+                  moveCount != 0 ? depth : std::min(MAX_PLY - 1, depth + 6), bestMove, unadjustedStaticEval);
+
+    // Correction history: en iyi hamle alış değilse ve hata yönü sınırla uyumluysa
+    if (!ss->inCheck && !(bestMove && pos.capture(bestMove)) && (bestValue > ss->staticEval) == bool(bestMove)) {
+        const int bonus = std::clamp(int(bestValue - ss->staticEval) * depth * (bestMove ? 12 : 18) / 128,
+                                     -CORRECTION_HISTORY_LIMIT / 4, CORRECTION_HISTORY_LIMIT / 4);
+        update_correction_history(pos, ss, 1061 * bonus / 1024);
+    }
 
     return bestValue;
 }
@@ -842,175 +1177,202 @@ Value Thread::qsearch(Position& pos, Search::Stack* ss, Value alpha, Value beta)
     using namespace Search;
     constexpr bool PvNode = NT == PV;
 
-    Move pv[MAX_PLY + 1];
-    Move ttMove, move, bestMove;
-    Value bestValue, value, ttValue, futilityValue, futilityBase;
-    bool pvHit, givesCheck, capture;
-    int moveCount = 0, quietCheckEvasions = 0;
+    assert(alpha >= -VALUE_INFINITE && alpha < beta && beta <= VALUE_INFINITE);
+    assert(PvNode || (alpha == beta - 1));
 
+    // Tek hamlede tekrar çekilebiliyorsa beraberlik alt sınırdır
+    if (alpha < VALUE_DRAW && pos.upcoming_repetition(ss->ply)) {
+        alpha = value_draw(nodes.load(std::memory_order_relaxed));
+        if (alpha >= beta) return alpha;
+    }
+
+    Move pv[MAX_PLY + 1];
+    Move move, bestMove;
+    Value bestValue, value, futilityBase;
+    bool pvHit, givesCheck, capture;
+    int moveCount;
+
+    // 1. Düğümü hazırla
     if (PvNode) {
         (ss + 1)->pv = pv;
         ss->pv[0] = Move::none();
     }
-
     bestMove = Move::none();
     ss->inCheck = pos.checkers();
+    moveCount = 0;
 
+    if (PvNode && selDepth < ss->ply + 1) selDepth = ss->ply + 1;
+
+    // 2. Beraberlik / en derin ply
     if (pos.is_draw(ss->ply) || ss->ply >= MAX_PLY)
-        return (ss->ply >= MAX_PLY && !ss->inCheck) ? Eval::evaluate(pos, evaluator) : VALUE_DRAW;
+        return (ss->ply >= MAX_PLY && !ss->inCheck) ? evaluate(pos) : VALUE_DRAW;
 
-    const Depth ttDepth = DEPTH_QS;
+    // 3. TT
     const Key posKey = pos.key();
     bool ttHit;
-    TTEntry* tte = TT.probe(posKey, ttHit);
+    TTData ttData;
+    TTEntry* tte = TT.probe(posKey, ttHit, ttData);
     ss->ttHit = ttHit;
-    ttValue = ttHit ? value_from_tt(tte->value(), ss->ply, pos.rule50()) : VALUE_NONE;
-    ttMove = ttHit ? tte->move() : Move::none();
-    pvHit = ttHit && tte->is_pv();
+    ttData.move = ttHit ? ttData.move : Move::none();
+    ttData.value = ttHit ? value_from_tt(ttData.value, ss->ply, pos.rule50()) : VALUE_NONE;
+    pvHit = ttHit && ttData.isPv;
 
-    if (!PvNode && ttHit && tte->depth() >= ttDepth && ttValue != VALUE_NONE
-        && (tte->bound() & (ttValue >= beta ? BOUND_LOWER : BOUND_UPPER)))
-        return ttValue;
+    if (!PvNode && ttData.depth >= DEPTH_QS && is_valid(ttData.value)
+        && (ttData.bound & (ttData.value >= beta ? BOUND_LOWER : BOUND_UPPER)))
+        return ttData.value;
 
-    if (ss->inCheck) {
-        ss->staticEval = VALUE_NONE;
+    // 4. Statik değerlendirme
+    Value unadjustedStaticEval = VALUE_NONE;
+    if (ss->inCheck)
         bestValue = futilityBase = -VALUE_INFINITE;
-    } else {
-        if (ttHit) {
-            if ((ss->staticEval = bestValue = tte->eval()) == VALUE_NONE)
-                ss->staticEval = bestValue = Eval::evaluate(pos, evaluator);
-            if (ttValue != VALUE_NONE && (tte->bound() & (ttValue > bestValue ? BOUND_LOWER : BOUND_UPPER)))
-                bestValue = ttValue;
-        } else
-            // Null move sonrası: değerlendirme sadece işaret değiştirir
-            ss->staticEval = bestValue =
-                (ss - 1)->currentMove != Move::null() ? Eval::evaluate(pos, evaluator) : -(ss - 1)->staticEval;
+    else {
+        const int correctionValue = correction_value(pos, ss);
+        if (ss->ttHit) {
+            unadjustedStaticEval = ttData.eval;
+            if (!is_valid(unadjustedStaticEval)) unadjustedStaticEval = evaluate(pos);
+            ss->staticEval = bestValue = to_corrected_static_eval(unadjustedStaticEval, correctionValue);
+            // TT değeri daha iyi bir tahmin olabilir
+            if (is_valid(ttData.value) && !is_decisive(ttData.value)
+                && (ttData.bound & (ttData.value > bestValue ? BOUND_LOWER : BOUND_UPPER)))
+                bestValue = ttData.value;
+        } else {
+            unadjustedStaticEval = evaluate(pos);
+            ss->staticEval = bestValue = to_corrected_static_eval(unadjustedStaticEval, correctionValue);
+        }
 
         // Stand pat
         if (bestValue >= beta) {
-            if (!ttHit)
-                tte->save(posKey, value_to_tt(bestValue, ss->ply), false, BOUND_LOWER, DEPTH_NONE, Move::none(),
-                          ss->staticEval);
+            if (!is_decisive(bestValue)) bestValue = (441 * bestValue + 583 * beta) / 1024;
+            if (!ss->ttHit)
+                tte->save(posKey, VALUE_NONE, false, BOUND_LOWER, DEPTH_UNSEARCHED, Move::none(), unadjustedStaticEval);
             return bestValue;
         }
-        if (PvNode && bestValue > alpha) alpha = bestValue;
-        futilityBase = bestValue + 118;
+        if (bestValue > alpha) alpha = bestValue;
+        futilityBase = ss->staticEval + 306;
     }
 
-    const PieceToHistory* contHist[] = {(ss - 1)->continuationHistory, (ss - 2)->continuationHistory};
+    const PieceToHistory* contHist[] = {(ss - 1)->continuationHistory};
     const Square prevSq = (ss - 1)->currentMove.is_ok() ? (ss - 1)->currentMove.to_sq() : SQ_NONE;
 
-    MovePicker mp(pos, ttMove, &mainHistory, &captureHistory, contHist);
+    // Şahta değilsek alışlar, şahtaysak tüm kaçışlar
+    MovePicker mp(pos, ttData.move, DEPTH_QS, &mainHistory, &lowPlyHistory, &captureHistory, contHist, &pawnHistory,
+                  ss->ply);
 
+    // 5. Hamle döngüsü
     while ((move = mp.next_move())) {
         givesCheck = pos.gives_check(move);
         capture = pos.capture_stage(move);
-        ++moveCount;
+        moveCount++;
 
-        // Futility ve hamle sayısı budaması
-        if (bestValue > VALUE_TB_LOSS_IN_MAX_PLY && !givesCheck && move.to_sq() != prevSq
-            && futilityBase > -VALUE_KNOWN_WIN && move.type_of() != PROMOTION) {
-            if (moveCount > 2) continue;
-            const Piece captured = move.type_of() == EN_PASSANT ? make_piece(~pos.side_to_move(), PAWN) : pos.piece_on(move.to_sq());
-            futilityValue = futilityBase + PieceValueEg[captured];
-            if (futilityValue <= alpha) {
-                bestValue = std::max(bestValue, futilityValue);
-                continue;
+        // 6. Budama
+        if (!is_loss(bestValue)) {
+            // Futility ve hamle sayısı budaması
+            if (!givesCheck && move.to_sq() != prevSq && !is_loss(futilityBase) && move.type_of() != PROMOTION) {
+                if (moveCount > 2) continue;
+
+                const Value futilityValue = futilityBase + PieceValue[pos.piece_on(move.to_sq())];
+                // Alınan taşla bile alpha'ya yetişemiyorsa
+                if (futilityValue <= alpha) {
+                    bestValue = std::max(bestValue, futilityValue);
+                    continue;
+                }
+                // SEE yeterince kötüyse
+                if (!pos.see_ge(move, alpha - futilityBase)) {
+                    bestValue = std::max(bestValue, std::min(alpha, futilityBase));
+                    continue;
+                }
             }
-            if (futilityBase <= alpha && !pos.see_ge(move, 1)) {
-                bestValue = std::max(bestValue, futilityBase);
-                continue;
-            }
+
+            // Alış olmayanları atla
+            if (!capture) continue;
+
+            // SEE'si kötü alışları arama
+            if (!pos.see_ge(move, -74)) continue;
         }
 
-        // Kaybettiren alışları arama
-        if (bestValue > VALUE_TB_LOSS_IN_MAX_PLY && !pos.see_ge(move)) continue;
-
-        ss->currentMove = move;
-        ss->continuationHistory = &continuationHistory[ss->inCheck][capture](pos.moved_piece(move), move.to_sq());
-
-        // Continuation history kötü olan sessiz kaçışları atla
-        if (!capture && bestValue > VALUE_TB_LOSS_IN_MAX_PLY
-            && (*contHist[0])(pos.moved_piece(move), move.to_sq()) < 0
-            && (*contHist[1])(pos.moved_piece(move), move.to_sq()) < 0)
-            continue;
-
-        // İkinci sessiz şah kaçışından sonra dur
-        if (quietCheckEvasions > 1) break;
-        quietCheckEvasions += !capture && ss->inCheck;
-
-        nodes.store(nodes.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-        pos.do_move(move);
+        // 7. Hamleyi yap ve ara
+        do_move(pos, move, ss);
         value = -qsearch<NT>(pos, ss + 1, -beta, -alpha);
-        pos.undo_move(move);
+        undo_move(pos, move);
 
+        // 8. En iyi hamle
         if (value > bestValue) {
             bestValue = value;
             if (value > alpha) {
                 bestMove = move;
                 if (PvNode) update_pv(ss->pv, move, (ss + 1)->pv);
-                if (PvNode && value < beta) alpha = value;
-                else break;
+                if (value < beta) alpha = value;
+                else break;  // fail high
             }
         }
     }
 
-    // Şahta ve hiç hamle aranmadıysa mat (budama olmadıysa)
-    if (ss->inCheck && bestValue == -VALUE_INFINITE) return mated_in(ss->ply);
+    // 9. Mat / pat
+    if (!moveCount) {
+        if (ss->inCheck) return mated_in(ss->ply);
 
-    tte->save(posKey, value_to_tt(bestValue, ss->ply), pvHit, bestValue >= beta ? BOUND_LOWER : BOUND_UPPER, ttDepth,
-              bestMove, ss->staticEval);
+        // Pat sadece özel durumda kontrol edilir: piyonlar itilemiyor, taş yok ve son hamle taş aldı
+        const Color us = pos.side_to_move();
+        const Bitboard pushes = us == WHITE ? shift<NORTH>(pos.pieces(us, PAWN)) : shift<SOUTH>(pos.pieces(us, PAWN));
+        if (!(pushes & ~pos.pieces()) && !pos.non_pawn_material(us) && type_of(pos.captured_piece()) >= KNIGHT
+            && !MoveList<LEGAL>(pos).size())
+            bestValue = VALUE_DRAW;
+    }
+
+    if (!is_decisive(bestValue) && bestValue > beta) bestValue = (462 * bestValue + 562 * beta) / 1024;
+
+    // 10. TT'ye yaz (düzeltilmemiş statik değerlendirme ile)
+    tte->save(posKey, value_to_tt(bestValue, ss->ply), pvHit, bestValue >= beta ? BOUND_LOWER : BOUND_UPPER, DEPTH_QS,
+              bestMove, unadjustedStaticEval);
+
     return bestValue;
 }
 
 // ---------------------------------------------------------------------------
 //  İstatistik güncellemeleri
 // ---------------------------------------------------------------------------
-void Thread::update_quiet_stats(const Position& pos, Search::Stack* ss, Move move, int bonus) {
-    if (ss->killers[0] != move) {
-        ss->killers[1] = ss->killers[0];
-        ss->killers[0] = move;
-    }
+void Thread::update_quiet_histories(const Position& pos, Search::Stack* ss, Move move, int bonus) {
     const Color us = pos.side_to_move();
     mainHistory(us, move) << bonus;
-    update_continuation_histories(ss, pos.moved_piece(move), move.to_sq(), bonus);
-    if ((ss - 1)->currentMove.is_ok()) {
-        const Square prevSq = (ss - 1)->currentMove.to_sq();
-        counterMoves(pos.piece_on(prevSq), prevSq) = move;
-    }
+    if (ss->ply < LOW_PLY_HISTORY_SIZE) lowPlyHistory(ss->ply, move) << bonus * 712 / 1024;
+    update_continuation_histories(ss, pos.moved_piece(move), move.to_sq(), bonus * 750 / 1024);
+    pawnHistory[pos](pos.moved_piece(move), move.to_sq()) << bonus * (bonus > -4 ? 1104 : 459) / 1024;
 }
 
-void Thread::update_all_stats(const Position& pos, Search::Stack* ss, Move bestMove, Value bestValue, Value beta,
-                              Square prevSq, Move* quietsSearched, int quietCount, Move* capturesSearched,
-                              int captureCount, Depth depth) {
-    const Color us = pos.side_to_move();
-    const Piece moved = pos.moved_piece(bestMove);
-    const int bonus1 = stat_bonus(depth + 1);
+void Thread::update_all_stats(const Position& pos, Search::Stack* ss, Move bestMove, Square prevSq,
+                              const Move* quietsSearched, int quietCount, const Move* capturesSearched,
+                              int captureCount, Depth depth, Move ttMove, bool PvNode) {
+    Piece movedPiece = pos.moved_piece(bestMove);
+    PieceType capturedPiece;
 
-    auto captured_type = [&](Move m) {
-        return m.type_of() == EN_PASSANT ? PAWN : type_of(pos.piece_on(m.to_sq()));
-    };
+    int bonus = std::min(133 * depth - 81, 1487) + 364 * (bestMove == ttMove) + (ss - 1)->statScore / 28;
+    const int malus = std::min(968 * depth - 235, 2244);
+
+    // Çok hamle denendiyse en iyisinin bonusu büyür
+    if (!PvNode) bonus += int(bonus * uint64_t(quietCount + captureCount) / 256);
 
     if (!pos.capture_stage(bestMove)) {
-        const int bonus2 = bestValue > beta + PawnValueMg ? bonus1 : stat_bonus(depth);
-        update_quiet_stats(pos, ss, bestMove, bonus2);
+        update_quiet_histories(pos, ss, bestMove, bonus * 899 / 1024);
+        // En iyi olmayan sessiz hamlelere azalan ceza
+        int actualMalus = malus * 1159 / 1024;
         for (int i = 0; i < quietCount; ++i) {
-            mainHistory(us, quietsSearched[i]) << -bonus2;
-            update_continuation_histories(ss, pos.moved_piece(quietsSearched[i]), quietsSearched[i].to_sq(), -bonus2);
+            actualMalus = actualMalus * 921 / 1024;
+            update_quiet_histories(pos, ss, quietsSearched[i], -actualMalus);
         }
-    } else
-        captureHistory(moved, bestMove.to_sq(), captured_type(bestMove)) << bonus1;
+    } else {
+        capturedPiece = type_of(pos.piece_on(bestMove.to_sq()));
+        captureHistory(movedPiece, bestMove.to_sq(), capturedPiece) << bonus * 1427 / 1024;
+    }
 
-    // Önceki ply'ın erken sessiz hamlesi burada çürütüldü: ceza
-    if (prevSq != SQ_NONE
-        && ((ss - 1)->moveCount == 1 + (ss - 1)->ttHit || (ss - 1)->currentMove == (ss - 1)->killers[0])
-        && !pos.captured_piece())
-        update_continuation_histories(ss - 1, pos.piece_on(prevSq), prevSq, -bonus1);
+    // Önceki ply'ın erken (TT hamlesi olmayan) sessiz hamlesi burada çürütüldü: ceza
+    if (prevSq != SQ_NONE && (ss - 1)->moveCount == 1 + (ss - 1)->ttHit && !pos.captured_piece())
+        update_continuation_histories(ss - 1, pos.piece_on(prevSq), prevSq, -malus * 713 / 1024);
 
-    for (int i = 0; i < captureCount; ++i)
-        captureHistory(pos.moved_piece(capturesSearched[i]), capturesSearched[i].to_sq(),
-                       captured_type(capturesSearched[i]))
-            << -bonus1;
+    for (int i = 0; i < captureCount; ++i) {
+        movedPiece = pos.moved_piece(capturesSearched[i]);
+        capturedPiece = type_of(pos.piece_on(capturesSearched[i].to_sq()));
+        captureHistory(movedPiece, capturesSearched[i].to_sq(), capturedPiece) << -malus * 1489 / 1024;
+    }
 }
 
 }  // namespace mai

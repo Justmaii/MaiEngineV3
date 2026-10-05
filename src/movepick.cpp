@@ -1,21 +1,23 @@
 // MaiEngine v3 — aşamalı hamle sıralayıcı
 // Copyright (C) 2026 Mai (Justmaii). GPLv3, bkz. LICENSE.
 //
-// Sıra (ana arama): TT hamlesi -> iyi alışlar (SEE) -> sessiz hamleler
-// (killer / counter önde, sonra history) -> kötü alışlar.
+// Stockfish 19'daki sıralayıcının uyarlaması (GPLv3).
+// Sıra (ana arama): TT hamlesi -> iyi alışlar (SEE) -> iyi sessiz hamleler
+// (history) -> kötü alışlar -> kötü sessiz hamleler.
 // Şahtayken: TT hamlesi -> tüm kaçışlar (alışlar önce).
 // Hamle üreticimiz zaten legal ürettiği için burada yasallık kontrolü yok;
 // sadece TT hamlesi (başka pozisyondan gelmiş olabilir) doğrulanıyor.
 #include "movepick.h"
 
 #include <limits>
+#include <utility>
 
 namespace mai {
 
 namespace {
 
 enum Stages {
-    MAIN_TT, CAPTURE_INIT, GOOD_CAPTURE, QUIET_INIT, QUIET, BAD_CAPTURE,
+    MAIN_TT, CAPTURE_INIT, GOOD_CAPTURE, QUIET_INIT, GOOD_QUIET, BAD_CAPTURE, BAD_QUIET,
     EVASION_TT, EVASION_INIT, EVASION,
     PROBCUT_TT, PROBCUT_INIT, PROBCUT,
     QSEARCH_TT, QCAPTURE_INIT, QCAPTURE
@@ -34,86 +36,82 @@ void partial_insertion_sort(ExtMove* begin, ExtMove* end, int limit) {
 
 }  // namespace
 
-MovePicker::MovePicker(const Position& p, Move ttm, Depth d, const ButterflyHistory* mh, const CaptureHistory* ch,
-                       const PieceToHistory** cont, Move counter, const Move* killers)
-    : pos(p), mainHistory(mh), captureHistory(ch), contHist(cont), ttMove(ttm), depth(d) {
-    refutations[0] = killers[0];
-    refutations[1] = killers[1];
-    refutations[2] = counter;
+MovePicker::MovePicker(const Position& p, Move ttm, Depth d, const ButterflyHistory* mh, const LowPlyHistory* lph,
+                       const CaptureHistory* ch, const PieceToHistory** cont, const PawnHistory* ph, int pl)
+    : pos(p), mainHistory(mh), lowPlyHistory(lph), captureHistory(ch), contHist(cont), pawnHistory(ph), ttMove(ttm),
+      depth(d), ply(pl) {
     const bool ttOk = ttm && pos.legal_move(ttm);
-    stage = (pos.checkers() ? EVASION_TT : MAIN_TT) + !ttOk;
     if (!ttOk) ttMove = Move::none();
+    if (pos.checkers()) stage = EVASION_TT + !ttOk;
+    else stage = (depth > 0 ? MAIN_TT : QSEARCH_TT) + !ttOk;
 }
 
-MovePicker::MovePicker(const Position& p, Move ttm, const ButterflyHistory* mh, const CaptureHistory* ch,
-                       const PieceToHistory** cont)
-    : pos(p), mainHistory(mh), captureHistory(ch), contHist(cont), ttMove(ttm) {
-    const bool inCheck = pos.checkers();
-    const bool ttOk = ttm && (inCheck || pos.capture_stage(ttm)) && pos.legal_move(ttm);
-    stage = (inCheck ? EVASION_TT : QSEARCH_TT) + !ttOk;
-    if (!ttOk) ttMove = Move::none();
-}
-
-MovePicker::MovePicker(const Position& p, Move ttm, Value th, const CaptureHistory* ch)
+MovePicker::MovePicker(const Position& p, Move ttm, int th, const CaptureHistory* ch)
     : pos(p), captureHistory(ch), ttMove(ttm), threshold(th) {
-    const bool ttOk = ttm && pos.capture(ttm) && pos.legal_move(ttm) && pos.see_ge(ttm, threshold);
-    stage = PROBCUT_TT + !ttOk;
+    const bool ttOk = ttm && pos.capture_stage(ttm) && pos.legal_move(ttm);
     if (!ttOk) ttMove = Move::none();
+    stage = PROBCUT_TT + !ttOk;
 }
 
+// Hamlelere sıralama puanı ver. Alışlar: alınan taşın değeri + capture history.
+// Sessiz hamleler: history tabloları, şah çekme bonusu, tehditten kaçma/girme.
 template <GenType T>
-void MovePicker::score() {
-    [[maybe_unused]] Bitboard threatenedByPawn = 0, threatenedByMinor = 0, threatenedByRook = 0, threatened = 0;
+ExtMove* MovePicker::score(ExtMove* end) {
+    const Color us = pos.side_to_move();
+
+    [[maybe_unused]] Bitboard threatByLesser[KING + 1];
     if constexpr (T == QUIETS) {
-        const Color us = pos.side_to_move(), them = ~us;
-        threatenedByPawn = them == WHITE ? pawn_attacks_bb<WHITE>(pos.pieces(them, PAWN))
-                                         : pawn_attacks_bb<BLACK>(pos.pieces(them, PAWN));
-        Bitboard minor = threatenedByPawn;
-        for (Bitboard b = pos.pieces(them, KNIGHT); b;) minor |= attacks_bb<KNIGHT>(pop_lsb(b));
-        for (Bitboard b = pos.pieces(them, BISHOP); b;) minor |= attacks_bb<BISHOP>(pop_lsb(b), pos.pieces());
-        threatenedByMinor = minor;
-        Bitboard rook = minor;
-        for (Bitboard b = pos.pieces(them, ROOK); b;) rook |= attacks_bb<ROOK>(pop_lsb(b), pos.pieces());
-        threatenedByRook = rook;
-        // Tehdit altındaki kendi taşlarımız: kaçan hamleye bonus
-        threatened = (pos.pieces(us, QUEEN) & threatenedByRook) | (pos.pieces(us, ROOK) & threatenedByMinor)
-                   | (pos.pieces(us, KNIGHT, BISHOP) & threatenedByPawn);
+        threatByLesser[PAWN] = 0;
+        threatByLesser[KNIGHT] = threatByLesser[BISHOP] = pos.attacks_by<PAWN>(~us);
+        threatByLesser[ROOK] = pos.attacks_by<KNIGHT>(~us) | pos.attacks_by<BISHOP>(~us) | threatByLesser[KNIGHT];
+        threatByLesser[QUEEN] = pos.attacks_by<ROOK>(~us) | threatByLesser[ROOK];
+        threatByLesser[KING] = 0;
     }
 
-    for (ExtMove* m = cur; m < endMoves; ++m) {
+    for (ExtMove* m = cur; m < end; ++m) {
         const Move mv = m->move;
         const Square from = mv.from_sq(), to = mv.to_sq();
         const Piece pc = pos.moved_piece(mv);
-        if constexpr (T == CAPTURES) {
-            const Piece captured = mv.type_of() == EN_PASSANT ? make_piece(~pos.side_to_move(), PAWN) : pos.piece_on(to);
-            m->value = 6 * PieceValueMg[captured] + (*captureHistory)(pc, to, type_of(captured));
-            if (mv.type_of() == PROMOTION) m->value += PieceValueMg[make_piece(WHITE, mv.promotion_type())];
-        } else if constexpr (T == QUIETS) {
-            const PieceType pt = type_of(pc);
-            m->value = 2 * (*mainHistory)(pos.side_to_move(), mv) + 2 * (*contHist[0])(pc, to)
-                     + (*contHist[1])(pc, to) + (*contHist[3])(pc, to) + (*contHist[5])(pc, to);
-            if (threatened & square_bb(from)) {
-                const Bitboard t = square_bb(to);
-                m->value += pt == QUEEN && !(t & threatenedByRook)   ? 50000
-                          : pt == ROOK && !(t & threatenedByMinor)   ? 25000
-                          : !(t & threatenedByPawn)                  ? 15000
-                                                                     : 0;
-            }
-            // Killer'lar ve counter en öne
-            if (mv == refutations[0]) m->value += 1 << 27;
-            else if (mv == refutations[1]) m->value += 1 << 26;
-            else if (mv == refutations[2]) m->value += 1 << 25;
+        const PieceType pt = type_of(pc);
+        const Piece captured = pos.piece_on(to);
+
+        if constexpr (T == CAPTURES)
+            m->value = (*captureHistory)(pc, to, type_of(captured)) + 7 * PieceValue[captured];
+        else if constexpr (T == QUIETS) {
+            m->value = 2 * (*mainHistory)(us, mv);
+            m->value += 2 * (*pawnHistory)[pos](pc, to);
+            m->value += (*contHist[0])(pc, to);
+            m->value += (*contHist[1])(pc, to);
+            m->value += (*contHist[2])(pc, to);
+            m->value += (*contHist[3])(pc, to);
+            m->value += (*contHist[5])(pc, to);
+
+            // Şah çeken hamleye bonus
+            m->value += ((pos.check_squares(pt) & square_bb(to)) && pos.see_ge(mv, -75)) * 16384;
+
+            // Daha değersiz bir taşın tehdit ettiği kareye girme cezası / oradan kaçma bonusu
+            const int v = 20 * (bool(threatByLesser[pt] & square_bb(from)) - bool(threatByLesser[pt] & square_bb(to)));
+            m->value += PieceValue[pt] * v;
+
+            if (ply < LOW_PLY_HISTORY_SIZE) m->value += 8 * (*lowPlyHistory)(ply, mv) / (1 + ply);
         } else {  // kaçışlar
-            if (pos.capture(mv)) {
-                const Piece captured = mv.type_of() == EN_PASSANT ? make_piece(~pos.side_to_move(), PAWN) : pos.piece_on(to);
-                m->value = PieceValueMg[captured] - int(type_of(pc)) + (1 << 28);
-            } else
-                m->value = (*mainHistory)(pos.side_to_move(), mv) + 2 * (*contHist[0])(pc, to) - (1 << 28);
+            if (pos.capture_stage(mv)) m->value = PieceValue[captured] + (1 << 28);
+            else m->value = (*mainHistory)(us, mv) + (*contHist[0])(pc, to);
         }
     }
+    return end;
 }
 
-Move MovePicker::next_move(bool skipQuiets) {
+// Koşulu sağlayan sıradaki hamle (TT hamlesi zaten verildiği için atlanır)
+template <typename Pred>
+Move MovePicker::select(Pred filter) {
+    for (; cur < endCur; ++cur)
+        if (cur->move != ttMove && filter()) return (cur++)->move;
+    return Move::none();
+}
+
+Move MovePicker::next_move() {
+    constexpr int goodQuietThreshold = -14000;
 top:
     switch (stage) {
     case MAIN_TT:
@@ -127,80 +125,63 @@ top:
     case PROBCUT_INIT:
     case QCAPTURE_INIT:
         cur = endBadCaptures = moves;
-        endMoves = generate<CAPTURES>(pos, cur);
-        score<CAPTURES>();
-        partial_insertion_sort(cur, endMoves, std::numeric_limits<int>::min());
+        endCur = endCaptures = score<CAPTURES>(generate<CAPTURES>(pos, cur));
+        partial_insertion_sort(cur, endCur, std::numeric_limits<int>::min());
         ++stage;
         goto top;
 
     case GOOD_CAPTURE:
-        while (cur < endMoves) {
-            ExtMove em = *cur++;
-            if (em.move == ttMove) continue;
-            // Kaybettiren alışları sona sakla
-            if (pos.see_ge(em.move, -69 * em.value / 1024)) return em.move;
-            *endBadCaptures++ = em;
-        }
+        if (Move m = select([&]() {
+                if (pos.see_ge(cur->move, -cur->value / 18)) return true;
+                // Kaybettiren alışları başa topla, sonra oynanacaklar
+                std::swap(*endBadCaptures++, *cur);
+                return false;
+            }))
+            return m;
         ++stage;
         [[fallthrough]];
 
     case QUIET_INIT:
         if (!skipQuiets) {
-            cur = endBadCaptures;
-            endMoves = generate<QUIETS>(pos, cur);
-            score<QUIETS>();
-            partial_insertion_sort(cur, endMoves, -3000 * depth);
+            endCur = endGenerated = score<QUIETS>(generate<QUIETS>(pos, cur));
+            partial_insertion_sort(cur, endCur, -3560 * depth);
         } else
-            cur = endMoves = endBadCaptures;
+            endGenerated = cur;
         ++stage;
         [[fallthrough]];
 
-    case QUIET:
+    case GOOD_QUIET:
         if (!skipQuiets)
-            while (cur < endMoves) {
-                Move m = (cur++)->move;
-                if (m != ttMove) return m;
-            }
+            if (Move m = select([&]() { return cur->value > goodQuietThreshold; })) return m;
         cur = moves;
-        endMoves = endBadCaptures;
+        endCur = endBadCaptures;
         ++stage;
         [[fallthrough]];
 
     case BAD_CAPTURE:
-        while (cur < endMoves) {
-            Move m = (cur++)->move;
-            if (m != ttMove) return m;
-        }
+        if (Move m = select([]() { return true; })) return m;
+        cur = endCaptures;
+        endCur = endGenerated;
+        ++stage;
+        [[fallthrough]];
+
+    case BAD_QUIET:
+        if (!skipQuiets) return select([&]() { return cur->value <= goodQuietThreshold; });
         return Move::none();
 
     case EVASION_INIT:
         cur = moves;
-        endMoves = generate<LEGAL>(pos, cur);
-        score<LEGAL>();
-        partial_insertion_sort(cur, endMoves, std::numeric_limits<int>::min());
+        endCur = endGenerated = score<LEGAL>(generate<LEGAL>(pos, cur));
+        partial_insertion_sort(cur, endCur, std::numeric_limits<int>::min());
         ++stage;
         [[fallthrough]];
 
     case EVASION:
-        while (cur < endMoves) {
-            Move m = (cur++)->move;
-            if (m != ttMove) return m;
-        }
-        return Move::none();
+    case QCAPTURE:
+        return select([]() { return true; });
 
     case PROBCUT:
-        while (cur < endMoves) {
-            Move m = (cur++)->move;
-            if (m != ttMove && pos.capture(m) && pos.see_ge(m, threshold)) return m;
-        }
-        return Move::none();
-
-    case QCAPTURE:
-        while (cur < endMoves) {
-            Move m = (cur++)->move;
-            if (m != ttMove) return m;
-        }
-        return Move::none();
+        return select([&]() { return pos.see_ge(cur->move, threshold); });
     }
     return Move::none();
 }

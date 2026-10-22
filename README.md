@@ -144,6 +144,26 @@ UCI seçenekleri: `Hash` (64), `Threads` (1), `Move Overhead` (10 ms), `Clear Ha
   (kalan süre − overhead): 1+0.01'de bile süreden kayıp yok.
 - **Lazy SMP:** paylaşılan TT, oylamayla en iyi iş parçacığı.
 
+## Oyun analizi
+
+chess.com'daki "Oyun İncelemesi" gibi: PGN'deki her hamleyi MaiEngine ile değerlendirip
+**Parlak, Harika, En İyi, Mükemmel, İyi, Kitap, Yanlışlık, Hata, Kaçırma, Büyük Hata**
+olarak sınıflandırır, doğruluk yüzdesi verir ve interaktif bir rapor üretir (tahta, animasyon,
+ses, değerlendirme çubuğu ve grafiği, en iyi hamleyi gösterme).
+
+```sh
+python3 -m venv tools/.venv && tools/.venv/bin/pip install chess   # bir kez
+tools/.venv/bin/python tools/site.py              # site: http://localhost:8080
+tools/.venv/bin/python tools/analiz.py oyun.pgn   # komut satırı: oyun.analiz.html
+```
+
+- **Sınıflar:** kazanma olasılığı kaybı (Lichess eğrisi, Elo'ya göre yumuşatma yok) —
+  %2 / %5 / %10 / %20 sınırları. Harika = tek iyi hamle (ikinci en iyi ≥%20 kötü),
+  Parlak = en iyi hamleyle gelen gerçek taş kurbanı.
+- **Kitap:** proje kökünde Polyglot `book.bin` varsa açılış hamleleri Kitap sayılır
+  (motor gözünde kötü kitap hamleleri — tuzak hatları — yine hata olur).
+- Kısayollar: ←/→ hamleler, **B** en iyi hamle, **F** tahtayı çevir, **M** ses.
+
 ## Maçlar
 
 `tools/match.py`: gerçek saat (süre+artış), paralel oyun, süreden kayıp tespiti,

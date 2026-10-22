@@ -12,3 +12,6 @@ tools/video/frames/
 tools/video/music.wav
 tools/video/timing.json
 tools/video/package-lock.json
+tools/.venv/
+book.bin
+analizler/

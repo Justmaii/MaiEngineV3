@@ -12,6 +12,7 @@ tools/video/frames/
 tools/video/music.wav
 tools/video/timing.json
 tools/video/package-lock.json
-tools/.venv/
+tools/MaiAraclar/bin/
+tools/MaiAraclar/obj/
 book.bin
 analizler/

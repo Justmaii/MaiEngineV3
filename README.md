@@ -28,7 +28,7 @@ hamle üretimi, NNUE çıkarımı, iş parçacıkları ve UCI bizim. Kaynak:
 | 2. NNUE (SF19: HalfKAv2_hm + tehditler + piyon çiftleri), NEON dotprod / AVX2, Finny tablosu | ✅ 300/300 birebir |
 | 3. Arama (Stockfish 19 portu + dev `49ea5ded`), correction history'ler, kovalı TT, SEE | ✅ |
 | 4. UCI, Lazy SMP, zaman yönetimi | ✅ (Syzygy ⏳) |
-| 5. Maç testleri (openings2.epd, `tools/match.py`) | ✅ başladı |
+| 5. Maç testleri (openings2.epd, `tools/MaiAraclar`) | ✅ başladı |
 
 ## Ağ dosyası
 
@@ -146,57 +146,25 @@ UCI seçenekleri: `Hash` (64), `Threads` (1), `Move Overhead` (10 ms), `Clear Ha
 
 ## Oyun analizi
 
-chess.com'daki "Oyun İncelemesi" gibi: PGN'deki her hamleyi MaiEngine ile değerlendirip
-**Parlak, Harika, En İyi, Mükemmel, İyi, Kitap, Yanlışlık, Hata, Kaçırma, Büyük Hata**
-olarak sınıflandırır, doğruluk yüzdesi verir ve interaktif bir rapor üretir (tahta, animasyon,
-ses, değerlendirme çubuğu ve grafiği, en iyi hamleyi gösterme).
+chess.com'daki "Oyun İncelemesi" gibi hamle sınıflandırması (Parlak, Harika, Hata, Büyük Hata…),
+doğruluk yüzdesi ve yerel site ayrı bir depoda: **[MaiAnaliz](https://github.com/Justmaii/MaiAnaliz)**
+(C# / .NET 10). Analizi bu motor yapıyor; MaiAnaliz'i bu klasörün yanına indirmek yeterli.
 
-### Kurulum (bir kez, macOS / Linux)
+## Geliştirme araçları
 
-Analiz motoru MaiEngine'in kendisi; önce onu indirip derlemek ve ağ dosyasını koymak gerekiyor.
-Gerekenler: `git`, C++20 derleyici (macOS'ta `xcode-select --install`, Linux'ta `g++` / `clang`,
-`make`) ve Python 3.
+`tools/MaiAraclar` (C# / .NET 10, dış paket yok):
 
 ```sh
-# 1. MaiEngine'i indir ve derle
-git clone https://github.com/Justmaii/MaiEngineV3.git
-cd MaiEngineV3
-make
-
-# 2. NNUE ağını indir (98 MB, Stockfish 19 ağı; depoda yok)
-curl -LO https://tests.stockfishchess.org/api/nn/nn-1a298aa575a0.nnue
-
-# 3. Analiz için Python ortamı
-python3 -m venv tools/.venv
-tools/.venv/bin/pip install chess
-
-# 4. (İsteğe bağlı) Açılış kitabı: herhangi bir Polyglot kitabını proje köküne book.bin adıyla koy.
-#    Yoksa analiz yine çalışır, sadece "Kitap" sınıfı çıkmaz.
+dotnet run --project tools/MaiAraclar -c Release -- mac --a ./maiengine --b ../opp/inphish5 \
+    --tc 10+0.1 --games 100 --concurrency 2 --out maclar/v3-vs-inphish5   # motor maçı
+dotnet run --project tools/MaiAraclar -c Release -- hiz 10 ./maiengine ../opp/inphish5  # arama hızı
+dotnet run --project tools/MaiAraclar -c Release -- perft-uret 600 3 > yeni.epd         # perft pozisyonları
+dotnet run --project tools/MaiAraclar -c Release -- muzik 64 music.wav                  # video müziği
 ```
-
-Doğru kurulduğunu görmek için: `./maiengine bench` hata vermeden düğüm sayısı yazmalı.
-
-### Kullanım
-
-```sh
-tools/.venv/bin/python tools/site.py              # site: http://localhost:8080 (tarayıcı kendiliğinden açılır)
-tools/.venv/bin/python tools/analiz.py oyun.pgn   # komut satırı: oyun.analiz.html
-```
-
-Sitede PGN'i sürükleyip bırak ya da yapıştır (chess.com'da oyun → Paylaş → PGN). Kullanıcı
-adını yazarsan siyahla oynadığın oyunlarda tahta senin tarafından açılır. Raporlar
-`analizler/` klasörüne de kaydedilir.
-
-- **Sınıflar:** kazanma olasılığı kaybı (Lichess eğrisi, Elo'ya göre yumuşatma yok) —
-  %2 / %5 / %10 / %20 sınırları. Harika = tek iyi hamle (ikinci en iyi ≥%20 kötü),
-  Parlak = en iyi hamleyle gelen gerçek taş kurbanı.
-- **Kitap:** proje kökünde Polyglot `book.bin` varsa açılış hamleleri Kitap sayılır
-  (motor gözünde kötü kitap hamleleri — tuzak hatları — yine hata olur).
-- Kısayollar: ←/→ hamleler, **B** en iyi hamle, **F** tahtayı çevir, **M** ses.
 
 ## Maçlar
 
-`tools/match.py`: gerçek saat (süre+artış), paralel oyun, süreden kayıp tespiti,
+`MaiAraclar mac`: gerçek saat (süre+artış), paralel oyun, süreden kayıp tespiti,
 PGN kaydı, elo ±%95. Açılışlar `tools/openings2.epd` (200 dengeli açılış, her biri
 iki renkle). inphish GitHub kaynağından derlendi (bench imzaları README'leriyle aynı:
 5.0 = 74474, 4.0 = 66999). Bulut makinesi: 2 çekirdek, 2 oyun paralel, Hash 64.
@@ -257,7 +225,7 @@ makinesinde SF19 3000'e karşı 16/20, 3190'a karşı 12,5/20 bildirmişti.
 
 <p align="center"><img src="docs/images/speed.png" alt="Arama hızı" width="100%"></p>
 
-`tools/speed.py`: tek iş parçacığı, Hash 64, başlangıç + bir orta oyun pozisyonu, 10'ar sn,
+`MaiAraclar hiz`: tek iş parçacığı, Hash 64, başlangıç + bir orta oyun pozisyonu, 10'ar sn,
 aynı bulut makinesi: MaiEngine v3 768k · inphish 4.0 711k · Stockfish 19 557k · inphish 5.0 383k
 düğüm/sn. (SF19 ve inphish 5 daha büyük bir ağ kullanıyor, düğüm başına daha pahalı.)
 
@@ -275,8 +243,8 @@ karşı 1,41M, orta oyun 1,09M'e karşı 1,31M, oyun sonu 2,30M'e karşı 2,43M)
 ## Görseller ve video
 
 `tools/video/`: `graphics.html` + `data.json` → `node graphics.js` README görsellerini,
-`video.html` → `node render.js` (Playwright ile kare kare) + `music.py` (telifsiz,
-numpy ile sentez) + ffmpeg tanıtım videosunu üretir. Her sayı `maclar/` altındaki
+`video.html` → `node render.js` (Playwright ile kare kare) + `MaiAraclar muzik` (telifsiz,
+sıfırdan sentez) + ffmpeg tanıtım videosunu üretir. Her sayı `maclar/` altındaki
 maç kayıtlarından geliyor. Kurulum: `cd tools/video && npm install`.
 
 ## Negatif sonuçlar

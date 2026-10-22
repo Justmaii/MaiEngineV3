@@ -151,11 +151,41 @@ chess.com'daki "Oyun İncelemesi" gibi: PGN'deki her hamleyi MaiEngine ile değe
 olarak sınıflandırır, doğruluk yüzdesi verir ve interaktif bir rapor üretir (tahta, animasyon,
 ses, değerlendirme çubuğu ve grafiği, en iyi hamleyi gösterme).
 
+### Kurulum (bir kez, macOS / Linux)
+
+Analiz motoru MaiEngine'in kendisi; önce onu indirip derlemek ve ağ dosyasını koymak gerekiyor.
+Gerekenler: `git`, C++20 derleyici (macOS'ta `xcode-select --install`, Linux'ta `g++` / `clang`,
+`make`) ve Python 3.
+
 ```sh
-python3 -m venv tools/.venv && tools/.venv/bin/pip install chess   # bir kez
-tools/.venv/bin/python tools/site.py              # site: http://localhost:8080
+# 1. MaiEngine'i indir ve derle
+git clone https://github.com/Justmaii/MaiEngineV3.git
+cd MaiEngineV3
+make
+
+# 2. NNUE ağını indir (98 MB, Stockfish 19 ağı; depoda yok)
+curl -LO https://tests.stockfishchess.org/api/nn/nn-1a298aa575a0.nnue
+
+# 3. Analiz için Python ortamı
+python3 -m venv tools/.venv
+tools/.venv/bin/pip install chess
+
+# 4. (İsteğe bağlı) Açılış kitabı: herhangi bir Polyglot kitabını proje köküne book.bin adıyla koy.
+#    Yoksa analiz yine çalışır, sadece "Kitap" sınıfı çıkmaz.
+```
+
+Doğru kurulduğunu görmek için: `./maiengine bench` hata vermeden düğüm sayısı yazmalı.
+
+### Kullanım
+
+```sh
+tools/.venv/bin/python tools/site.py              # site: http://localhost:8080 (tarayıcı kendiliğinden açılır)
 tools/.venv/bin/python tools/analiz.py oyun.pgn   # komut satırı: oyun.analiz.html
 ```
+
+Sitede PGN'i sürükleyip bırak ya da yapıştır (chess.com'da oyun → Paylaş → PGN). Kullanıcı
+adını yazarsan siyahla oynadığın oyunlarda tahta senin tarafından açılır. Raporlar
+`analizler/` klasörüne de kaydedilir.
 
 - **Sınıflar:** kazanma olasılığı kaybı (Lichess eğrisi, Elo'ya göre yumuşatma yok) —
   %2 / %5 / %10 / %20 sınırları. Harika = tek iyi hamle (ikinci en iyi ≥%20 kötü),
